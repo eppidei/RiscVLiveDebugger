@@ -70,6 +70,7 @@ To avoid debug bus collisions, target panics, or race conditions with the runnin
 +-------------------+      +----------------------+      +----------+
 |  halt; wait_halt  | ---> | read / write command | ---> |  resume  |
 +-------------------+      +----------------------+      +----------+
+```
 
 Because OpenOCD handles this at the hardware level, the core halts only for the handful of clock cycles required to service the debug bus request, making it virtually transparent to human perception and real-time loops.
 
