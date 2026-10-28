@@ -66,7 +66,9 @@ This tool bypasses GDB entirely. It communicates with OpenOCD via a lightweight 
 
 To avoid debug bus collisions, target panics, or race conditions with the running firmware, all transactions execute an atomic 3-step sequence:
 
-$$\text{halt; wait\_halt} \longrightarrow \text{read / write command} \longrightarrow \text{resume}$$
+```mermaid
+flowchart LR
+    A["halt; wait_halt"] --> B["read / write command"] --> C["resume"]
 
 Because OpenOCD handles this at the hardware level, the core halts only for the handful of clock cycles required to service the debug bus request, making it virtually transparent to human perception and real-time loops.
 
