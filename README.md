@@ -239,7 +239,7 @@ Unlike GDB-mediated resets that halt execution at the reset vector or intercept 
 1. Power up the target hardware and attach the JTAG programmer.
 2. Launch the application:
    ```bash
-   python polarfire_gui.py
+   python RiscVLiveDebugger.py
    ```
 3. If managing OpenOCD from the GUI:
    * Browse to `openocd.exe`.
