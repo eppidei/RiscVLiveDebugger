@@ -946,21 +946,53 @@ class ModernOpenOCD_GUI(ctk.CTk):
             cfg_dir = os.path.dirname(cfg)
             cfg_file = os.path.basename(cfg)
             
-            cmd = [exe, "-s", cfg_dir, "-f", cfg_file]
-            
             try:
-                c_flags = subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0
-                self.ocd_process = subprocess.Popen(cmd, cwd=cfg_dir, creationflags=c_flags)
+                if os.name == 'nt':
+                    # Launch OpenOCD in a new console window and colorize Error/Warn/Info lines live
+                    ps_script = (
+                        f"$host.UI.RawUI.WindowTitle = 'OpenOCD Live Console'; "
+                        f"& '{exe}' -s '{cfg_dir}' -f '{cfg_file}' 2>&1 | ForEach-Object {{ "
+                        f"if ($_ -match 'Error') {{ Write-Host $_ -ForegroundColor Red }} "
+                        f"elseif ($_ -match 'Warn') {{ Write-Host $_ -ForegroundColor Yellow }} "
+                        f"elseif ($_ -match 'Info') {{ Write-Host $_ -ForegroundColor Cyan }} "
+                        f"else {{ Write-Host $_ -ForegroundColor Gray }} }}"
+                    )
+                    cmd = ["powershell", "-NoLogo", "-NoExit", "-Command", ps_script]
+                    self.ocd_process = subprocess.Popen(
+                        cmd,
+                        cwd=cfg_dir,
+                        creationflags=subprocess.CREATE_NEW_CONSOLE
+                    )
+                else:
+                    cmd = [exe, "-s", cfg_dir, "-f", cfg_file]
+                    self.ocd_process = subprocess.Popen(cmd, cwd=cfg_dir)
+
                 self.btn_start_ocd.configure(text="Stop OpenOCD", fg_color="#C62828", hover_color="#b71c1c")
-                self.log_msg("OpenOCD started. Check the new terminal window for errors.")
+                self.log_msg("OpenOCD started in colorized console window.")
             except Exception as e:
                 self.log_msg(f"Failed to start OpenOCD: {e}")
         else:
-            self.ocd_process.terminate()
-            self.ocd_process.wait()
-            self.ocd_process = None
+            self.stop_openocd_process()
             self.btn_start_ocd.configure(text="Start OpenOCD", fg_color="#00695C", hover_color="#004D40")
             self.log_msg("OpenOCD server stopped.")
+
+    def stop_openocd_process(self):
+        if self.ocd_process:
+            if os.name == 'nt':
+                # /T kills both the PowerShell wrapper and the child openocd.exe process
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(self.ocd_process.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            else:
+                self.ocd_process.terminate()
+                self.ocd_process.wait()
+            self.ocd_process = None
+
+    def on_closing(self):
+        self.stop_openocd_process()
+        self.destroy()
 
     def reset_target(self):
         def _task():
@@ -973,13 +1005,6 @@ class ModernOpenOCD_GUI(ctk.CTk):
             except Exception as e:
                 self.after(0, lambda: self.log_msg(f"Reset failed (Is OpenOCD running?): {e}"))
         threading.Thread(target=_task, daemon=True).start()
-
-    def on_closing(self):
-        if self.ocd_process:
-            self.log_msg("Terminating OpenOCD before exit...")
-            self.ocd_process.terminate()
-            self.ocd_process.wait()
-        self.destroy()
 
     def load_map_file(self):
         filepath = filedialog.askopenfilename(filetypes=[("Map Files", "*.map"), ("All Files", "*.*")])
