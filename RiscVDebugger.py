@@ -5,6 +5,7 @@ import threading
 import re
 import json
 import os
+import struct
 import subprocess
 from collections import deque
 
@@ -105,25 +106,30 @@ class VarSlider(BaseWidget):
         hex_val = hex(value)
         
         def _write_task():
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(2.0)
-                    s.connect(("localhost", 6666))
-                    def send_and_wait(command):
-                        s.sendall(command.encode('utf-8') + b'\x1a')
-                        resp = b""
-                        while b'\x1a' not in resp:
-                            chunk = s.recv(1024)
-                            if not chunk: break
-                            resp += chunk
-                        return resp.decode('utf-8').strip('\x1a\r\n')
+            with self.app.jtag_lock:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(2.0)
+                        s.connect(("localhost", 6666))
+                        def send_and_wait(command):
+                            s.sendall(command.encode('utf-8') + b'\x1a')
+                            resp = b""
+                            while b'\x1a' not in resp:
+                                chunk = s.recv(1024)
+                                if not chunk: break
+                                resp += chunk
+                            return resp.decode('utf-8').strip('\x1a\r\n')
 
-                    send_and_wait("halt; wait_halt")
-                    send_and_wait(f"{mem_cmd} {addr} {hex_val}")
-                    send_and_wait("resume")
-                    self.after(0, lambda: self.app.log_msg(f"Wrote {value} ({hex_val}) to {name}"))
-            except Exception as e:
-                self.after(0, lambda: self.app.log_msg(f"Write ERROR: {str(e)}"))
+                        state = send_and_wait("[[target current] curstate]")
+                        was_running = ("running" in state)
+                        if was_running:
+                            send_and_wait("halt; wait_halt")
+                        send_and_wait(f"{mem_cmd} {addr} {hex_val}")
+                        if was_running and not self.app.target_halted_at_bp:
+                            send_and_wait("resume")
+                        self.after(0, lambda: self.app.log_msg(f"Wrote {value} ({hex_val}) to {name}"))
+                except Exception as e:
+                    self.after(0, lambda: self.app.log_msg(f"Write ERROR: {str(e)}"))
 
         threading.Thread(target=_write_task, daemon=True).start()
 
@@ -272,7 +278,7 @@ class ReadMonitor(BaseWidget):
         if self.auto_poll.get():
             self.execute_read()
 
-    def execute_read(self):
+    def execute_read(self, halted_only=False):
         if not self.winfo_exists(): return
         
         name = self.var_name.get()
@@ -294,31 +300,41 @@ class ReadMonitor(BaseWidget):
         mem_cmd = cmd_map.get(v_type.replace("uint", "").replace("int", ""), "mdw")
         
         def _read_task():
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(2.0)
-                    s.connect(("localhost", 6666))
-                    
-                    def send_and_wait(command):
-                        s.sendall(command.encode('utf-8') + b'\x1a')
-                        resp = b""
-                        while b'\x1a' not in resp:
-                            chunk = s.recv(1024)
-                            if not chunk: break
-                            resp += chunk
-                        return resp.decode('utf-8').strip('\x1a\r\n')
+            with self.app.jtag_lock:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(2.0)
+                        s.connect(("localhost", 6666))
+                        
+                        def send_and_wait(command):
+                            s.sendall(command.encode('utf-8') + b'\x1a')
+                            resp = b""
+                            while b'\x1a' not in resp:
+                                chunk = s.recv(1024)
+                                if not chunk: break
+                                resp += chunk
+                            return resp.decode('utf-8').strip('\x1a\r\n')
 
-                    send_and_wait("halt; wait_halt")
-                    read_output = send_and_wait(f"{mem_cmd} {addr}")
-                    send_and_wait("resume")
-                    
-                    self.after(0, lambda: self.process_read_result(read_output))
-            except Exception:
-                pass # Fail silently on timeout during fast polling
+                        if halted_only or self.app.target_halted_at_bp:
+                            read_output = send_and_wait(f"{mem_cmd} {addr}")
+                        else:
+                            state = send_and_wait("[[target current] curstate]")
+                            if "halted" in state:
+                                # Target just hit a breakpoint; do not resume!
+                                self.after(0, self.app.disable_all_auto_poll)
+                                read_output = send_and_wait(f"{mem_cmd} {addr}")
+                            else:
+                                send_and_wait("halt; wait_halt")
+                                read_output = send_and_wait(f"{mem_cmd} {addr}")
+                                send_and_wait("resume")
+                        
+                        self.after(0, lambda: self.process_read_result(read_output))
+                except Exception:
+                    pass
 
         threading.Thread(target=_read_task, daemon=True).start()
 
-        if self.auto_poll.get():
+        if self.auto_poll.get() and not halted_only:
             self.after(interval, self.execute_read)
 
     def process_read_result(self, response):
@@ -461,6 +477,8 @@ class ReadMonitor(BaseWidget):
         if state.get("auto_poll", False):
             self.auto_poll.set(True)
             self.toggle_poll()
+
+
 class MemBlockPlotter(BaseWidget):
     # --- MEMORY BLOCK DUMP & HISTOGRAM WIDGET ---
     def __init__(self, parent, app):
@@ -524,7 +542,7 @@ class MemBlockPlotter(BaseWidget):
         if self.last_values:
             self.draw_graph(self.last_values)
 
-    def execute_dump(self):
+    def execute_dump(self, halted_only=False):
         if not self.winfo_exists(): return
         
         name = self.base_addr.get()
@@ -544,30 +562,39 @@ class MemBlockPlotter(BaseWidget):
         cmd = "mdb" if ws == "8" else ("mdh" if ws == "16" else "mdw")
         
         def _dump_task():
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(3.0) 
-                    s.connect(("localhost", 6666))
-                    def send_and_wait(command):
-                        s.sendall(command.encode('utf-8') + b'\x1a')
-                        resp = b""
-                        while b'\x1a' not in resp:
-                            chunk = s.recv(1024)
-                            if not chunk: break
-                            resp += chunk
-                        return resp.decode('utf-8').strip('\x1a\r\n')
+            with self.app.jtag_lock:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(3.0) 
+                        s.connect(("localhost", 6666))
+                        def send_and_wait(command):
+                            s.sendall(command.encode('utf-8') + b'\x1a')
+                            resp = b""
+                            while b'\x1a' not in resp:
+                                chunk = s.recv(1024)
+                                if not chunk: break
+                                resp += chunk
+                            return resp.decode('utf-8').strip('\x1a\r\n')
 
-                    send_and_wait("halt; wait_halt")
-                    raw_data = send_and_wait(f"{cmd} {addr} {count}")
-                    send_and_wait("resume")
-                    
-                    self.after(0, lambda: self.process_dump(raw_data))
-            except Exception as e:
-                pass 
+                        if halted_only or self.app.target_halted_at_bp:
+                            raw_data = send_and_wait(f"{cmd} {addr} {count}")
+                        else:
+                            state = send_and_wait("[[target current] curstate]")
+                            if "halted" in state:
+                                self.after(0, self.app.disable_all_auto_poll)
+                                raw_data = send_and_wait(f"{cmd} {addr} {count}")
+                            else:
+                                send_and_wait("halt; wait_halt")
+                                raw_data = send_and_wait(f"{cmd} {addr} {count}")
+                                send_and_wait("resume")
+                        
+                        self.after(0, lambda: self.process_dump(raw_data))
+                except Exception:
+                    pass 
 
         threading.Thread(target=_dump_task, daemon=True).start()
         
-        if self.auto_poll.get():
+        if self.auto_poll.get() and not halted_only:
             self.after(interval, self.execute_dump)
 
     def process_dump(self, raw_text):
@@ -693,40 +720,45 @@ class MemFileLoader(BaseWidget):
         self.upload_btn.configure(state="disabled")
 
         def _upload_task():
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(5.0)
-                    s.connect(("localhost", 6666))
-                    def send_and_wait(command):
-                        s.sendall(command.encode('utf-8') + b'\x1a')
-                        resp = b""
-                        while b'\x1a' not in resp:
-                            chunk = s.recv(1024)
-                            if not chunk: break
-                            resp += chunk
-                        return resp.decode('utf-8').strip('\x1a\r\n')
+            with self.app.jtag_lock:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(5.0)
+                        s.connect(("localhost", 6666))
+                        def send_and_wait(command):
+                            s.sendall(command.encode('utf-8') + b'\x1a')
+                            resp = b""
+                            while b'\x1a' not in resp:
+                                chunk = s.recv(1024)
+                                if not chunk: break
+                                resp += chunk
+                            return resp.decode('utf-8').strip('\x1a\r\n')
 
-                    send_and_wait("halt; wait_halt")
-                    
-                    batch_size = 30
-                    for i in range(0, len(self.file_data), batch_size):
-                        batch = self.file_data[i:i+batch_size]
-                        cmd_string = ""
-                        for j, val in enumerate(batch):
-                            addr = hex(base_addr_int + (i + j) * byte_step)
-                            cmd_string += f"{cmd} {addr} {hex(val)}; "
-                        send_and_wait(cmd_string)
+                        state = send_and_wait("[[target current] curstate]")
+                        was_running = ("running" in state)
+                        if was_running:
+                            send_and_wait("halt; wait_halt")
                         
-                    send_and_wait("resume")
-                    
-                    self.after(0, lambda: self.status_label.configure(text=f"Success: Uploaded {len(self.file_data)} words.", text_color="#4CAF50"))
+                        batch_size = 30
+                        for i in range(0, len(self.file_data), batch_size):
+                            batch = self.file_data[i:i+batch_size]
+                            cmd_string = ""
+                            for j, val in enumerate(batch):
+                                addr = hex(base_addr_int + (i + j) * byte_step)
+                                cmd_string += f"{cmd} {addr} {hex(val)}; "
+                            send_and_wait(cmd_string)
+                            
+                        if was_running and not self.app.target_halted_at_bp:
+                            send_and_wait("resume")
+                        
+                        self.after(0, lambda: self.status_label.configure(text=f"Success: Uploaded {len(self.file_data)} words.", text_color="#4CAF50"))
+                        self.after(0, lambda: self.upload_btn.configure(state="normal"))
+                        self.after(0, lambda: self.app.log_msg(f"Finished writing {len(self.file_data)} words to {name}"))
+                        
+                except Exception as e:
+                    self.after(0, lambda: self.status_label.configure(text="Upload Failed!", text_color="#C62828"))
                     self.after(0, lambda: self.upload_btn.configure(state="normal"))
-                    self.after(0, lambda: self.app.log_msg(f"Finished writing {len(self.file_data)} words to {name}"))
-                    
-            except Exception as e:
-                self.after(0, lambda: self.status_label.configure(text="Upload Failed!", text_color="#C62828"))
-                self.after(0, lambda: self.upload_btn.configure(state="normal"))
-                self.after(0, lambda: self.app.log_msg(f"Loader ERROR: {str(e)}"))
+                    self.after(0, lambda: self.app.log_msg(f"Loader ERROR: {str(e)}"))
 
         threading.Thread(target=_upload_task, daemon=True).start()
 
@@ -762,7 +794,6 @@ class AliveLightWidget(BaseWidget):
         display_frame = ctk.CTkFrame(self, fg_color="transparent")
         display_frame.pack(fill="x", padx=15, pady=(5, 10))
 
-        # Circular Indicator Lamp
         self.light = ctk.CTkLabel(display_frame, text="", width=30, height=30, corner_radius=15, fg_color="#424242")
         self.light.pack(side="left", padx=(10, 15))
 
@@ -781,7 +812,7 @@ class AliveLightWidget(BaseWidget):
             self.light.configure(fg_color="#424242")
             self.status_lbl.configure(text="Stopped", text_color="gray")
 
-    def execute_read(self):
+    def execute_read(self, halted_only=False):
         if not self.winfo_exists(): return
         
         name = self.var_name.get()
@@ -798,30 +829,39 @@ class AliveLightWidget(BaseWidget):
         cmd = "mdb" if "8" in v_type else ("mdh" if "16" in v_type else "mdw")
         
         def _read_task():
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(2.0)
-                    s.connect(("localhost", 6666))
-                    def send_and_wait(command):
-                        s.sendall(command.encode('utf-8') + b'\x1a')
-                        resp = b""
-                        while b'\x1a' not in resp:
-                            chunk = s.recv(1024)
-                            if not chunk: break
-                            resp += chunk
-                        return resp.decode('utf-8').strip('\x1a\r\n')
+            with self.app.jtag_lock:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(2.0)
+                        s.connect(("localhost", 6666))
+                        def send_and_wait(command):
+                            s.sendall(command.encode('utf-8') + b'\x1a')
+                            resp = b""
+                            while b'\x1a' not in resp:
+                                chunk = s.recv(1024)
+                                if not chunk: break
+                                resp += chunk
+                            return resp.decode('utf-8').strip('\x1a\r\n')
 
-                    send_and_wait("halt; wait_halt")
-                    output = send_and_wait(f"{cmd} {addr}")
-                    send_and_wait("resume")
-                    
-                    self.after(0, lambda: self.process_read(output))
-            except Exception:
-                self.after(0, lambda: self.set_error("Comm Error"))
+                        if halted_only or self.app.target_halted_at_bp:
+                            output = send_and_wait(f"{cmd} {addr}")
+                        else:
+                            state = send_and_wait("[[target current] curstate]")
+                            if "halted" in state:
+                                self.after(0, self.app.disable_all_auto_poll)
+                                output = send_and_wait(f"{cmd} {addr}")
+                            else:
+                                send_and_wait("halt; wait_halt")
+                                output = send_and_wait(f"{cmd} {addr}")
+                                send_and_wait("resume")
+                        
+                        self.after(0, lambda: self.process_read(output))
+                except Exception:
+                    self.after(0, lambda: self.set_error("Comm Error"))
 
         threading.Thread(target=_read_task, daemon=True).start()
         
-        if self.auto_poll.get():
+        if self.auto_poll.get() and not halted_only:
             self.after(interval, self.execute_read)
 
     def process_read(self, output):
@@ -854,13 +894,559 @@ class AliveLightWidget(BaseWidget):
             self.auto_poll.set(True)
             self.toggle_poll()
 
+class BaseBreakpointWidget(BaseWidget):
+    # --- SHARED BASE CLASS FOR ALL 3 BREAKPOINT WIDGETS ---
+    FORMATS = ["Hex", "uint32", "int32", "uint16", "int16", "uint8", "int8", "float", "bin"]
+
+    def __init__(self, parent, app, border_color="#00ACC1"):
+        super().__init__(parent, corner_radius=10, border_width=2, border_color=border_color)
+        self.app = app
+        self.pack(fill="x", pady=10, padx=10)
+
+        self.is_armed = False
+        self.is_halted_here = False
+        self.active_bp_addr = None
+        self.keep_armed = ctk.BooleanVar(value=True)
+        self.global_fmt = ctk.StringVar(value="Hex")
+        self.filter_var = ctk.StringVar(value="")
+        self.var_rows = {}  # {var_name: {"addr": str, "raw": int|None, "fmt_var": StringVar, "val_lbl": CTkLabel, "frame": CTkFrame}}
+
+        self.top_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.top_frame.pack(fill="x", padx=10, pady=(10, 5))
+
+        # Subclasses populate self.top_frame columns 0..N
+        self.build_specific_controls(self.top_frame)
+
+        # Status & Action Bar
+        ctrl_frame = ctk.CTkFrame(self, fg_color="transparent")
+        ctrl_frame.pack(fill="x", padx=15, pady=(2, 5))
+
+        self.arm_btn = ctk.CTkButton(ctrl_frame, text="Arm Breakpoint", width=120, fg_color="#00838F", hover_color="#006064", command=self.toggle_arm)
+        self.arm_btn.pack(side="left", padx=(0, 10))
+
+        self.resume_btn = ctk.CTkButton(ctrl_frame, text="Resume Code", width=110, fg_color="#2E7D32", hover_color="#1B5E20", state="disabled", command=self.resume_target)
+        self.resume_btn.pack(side="left", padx=(0, 10))
+
+        ctk.CTkCheckBox(ctrl_frame, text="Keep Armed on Resume", variable=self.keep_armed, width=140).pack(side="left", padx=5)
+
+        self.status_lbl = ctk.CTkLabel(ctrl_frame, text="Status: Disarmed", font=("Consolas", 13, "bold"), text_color="gray")
+        self.status_lbl.pack(side="left", padx=15)
+
+        # Variable List Header & Format Controls
+        list_hdr = ctk.CTkFrame(self, fg_color="#1A1A1A", corner_radius=6)
+        list_hdr.pack(fill="x", padx=15, pady=(5, 2))
+
+        ctk.CTkLabel(list_hdr, text="Variables Snapshot:", font=("Consolas", 12, "bold")).pack(side="left", padx=8, pady=4)
+        ctk.CTkLabel(list_hdr, text="Filter:").pack(side="left", padx=(10, 2))
+        filter_entry = ctk.CTkEntry(list_hdr, textvariable=self.filter_var, width=120, placeholder_text="var name...")
+        filter_entry.pack(side="left", padx=2, pady=4)
+        filter_entry.bind("<KeyRelease>", lambda e: self.apply_filter())
+
+        ctk.CTkButton(list_hdr, text="Reload .map Vars", width=110, fg_color="#424242", hover_color="#616161", command=self.populate_var_rows).pack(side="right", padx=6, pady=4)
+        ctk.CTkComboBox(list_hdr, variable=self.global_fmt, values=self.FORMATS, width=90, command=self.apply_global_format).pack(side="right", padx=4, pady=4)
+        ctk.CTkLabel(list_hdr, text="Format All:").pack(side="right", padx=4)
+
+        # Compact Scrollable List of Variables
+        self.var_scroll = ctk.CTkScrollableFrame(self, height=175, corner_radius=6, fg_color="#1E1E1E")
+        self.var_scroll.pack(fill="x", padx=15, pady=(2, 12))
+
+        self.populate_var_rows()
+
+    def build_specific_controls(self, parent):
+        pass
+
+    def resolve_trigger_command(self):
+        """Override in subclass: returns (addr_hex, set_cmd, clear_cmd, description) or None."""
+        return None
+
+    def on_symbol_files_updated(self):
+        """Called by main GUI when .map or .lst files are reloaded."""
+        self.populate_var_rows()
+
+    def populate_var_rows(self):
+        for child in self.var_scroll.winfo_children():
+            child.destroy()
+        self.var_rows.clear()
+
+        source_vars = self.app.var_symbols if self.app.var_symbols else self.app.symbol_table
+        if not source_vars:
+            ctk.CTkLabel(self.var_scroll, text="Load a .map file to populate the variable snapshot list.", text_color="gray").pack(pady=10)
+            return
+
+        for var_name in sorted(source_vars.keys()):
+            addr = source_vars[var_name]
+            row = ctk.CTkFrame(self.var_scroll, fg_color="transparent")
+            row.pack(fill="x", pady=1, padx=4)
+
+            ctk.CTkLabel(row, text=var_name, font=("Consolas", 12), width=210, anchor="w").pack(side="left", padx=(4, 8))
+            ctk.CTkLabel(row, text=addr, font=("Consolas", 11), text_color="#888888", width=105, anchor="w").pack(side="left", padx=4)
+
+            val_lbl = ctk.CTkLabel(row, text="---", font=("Consolas", 13, "bold"), text_color="#00E676", width=180, anchor="w")
+            val_lbl.pack(side="left", padx=10)
+
+            fmt_var = ctk.StringVar(value=self.global_fmt.get())
+            fmt_box = ctk.CTkComboBox(
+                row,
+                variable=fmt_var,
+                values=self.FORMATS,
+                width=90,
+                command=lambda choice, vn=var_name: self.update_single_row_display(vn)
+            )
+            fmt_box.pack(side="right", padx=4)
+
+            self.var_rows[var_name] = {
+                "addr": addr,
+                "raw": None,
+                "fmt_var": fmt_var,
+                "val_lbl": val_lbl,
+                "frame": row
+            }
+
+        self.apply_filter()
+
+    def apply_filter(self):
+        query = self.filter_var.get().strip().lower()
+        for var_name, info in self.var_rows.items():
+            if not query or query in var_name.lower():
+                info["frame"].pack(fill="x", pady=1, padx=4)
+            else:
+                info["frame"].pack_forget()
+
+    def apply_global_format(self, fmt_choice):
+        for var_name, info in self.var_rows.items():
+            info["fmt_var"].set(fmt_choice)
+            self.update_single_row_display(var_name)
+
+    @staticmethod
+    def format_raw_value(raw_u32, fmt):
+        if raw_u32 is None:
+            return "---"
+        raw_u32 &= 0xFFFFFFFF
+        if fmt == "Hex":
+            return f"0x{raw_u32:08X}"
+        elif fmt == "uint32":
+            return str(raw_u32)
+        elif fmt == "int32":
+            val = raw_u32 - (1 << 32) if (raw_u32 & 0x80000000) else raw_u32
+            return str(val)
+        elif fmt == "uint16":
+            return str(raw_u32 & 0xFFFF)
+        elif fmt == "int16":
+            v16 = raw_u32 & 0xFFFF
+            return str(v16 - (1 << 16) if (v16 & 0x8000) else v16)
+        elif fmt == "uint8":
+            return str(raw_u32 & 0xFF)
+        elif fmt == "int8":
+            v8 = raw_u32 & 0xFF
+            return str(v8 - (1 << 8) if (v8 & 0x80) else v8)
+        elif fmt == "float":
+            try:
+                f_val = struct.unpack('<f', struct.pack('<I', raw_u32))[0]
+                return f"{f_val:.6g}"
+            except Exception:
+                return "NaN"
+        elif fmt == "bin":
+            return f"0b{raw_u32:032b}"
+        return f"0x{raw_u32:08X}"
+
+    def update_single_row_display(self, var_name):
+        info = self.var_rows.get(var_name)
+        if not info:
+            return
+        formatted = self.format_raw_value(info["raw"], info["fmt_var"].get())
+        info["val_lbl"].configure(text=formatted)
+
+    def toggle_arm(self):
+        if not self.is_armed:
+            trig = self.resolve_trigger_command()
+            if not trig:
+                return
+            addr, set_cmd, clear_cmd, desc = trig
+            self.active_bp_addr = addr
+            self.set_cmd = set_cmd
+            self.clear_cmd = clear_cmd
+            self.bp_desc = desc
+
+            def _arm_task():
+                with self.app.jtag_lock:
+                    try:
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                            s.settimeout(2.0)
+                            s.connect(("localhost", 6666))
+                            def send_and_wait(command):
+                                s.sendall(command.encode('utf-8') + b'\x1a')
+                                resp = b""
+                                while b'\x1a' not in resp:
+                                    chunk = s.recv(1024)
+                                    if not chunk: break
+                                    resp += chunk
+                                return resp.decode('utf-8').strip('\x1a\r\n')
+
+                            state = send_and_wait("[[target current] curstate]")
+                            was_running = ("running" in state)
+                            if was_running:
+                                send_and_wait("halt; wait_halt")
+                            send_and_wait(self.clear_cmd)
+                            send_and_wait(self.set_cmd)
+                            if was_running:
+                                send_and_wait("resume")
+
+                        self.is_armed = True
+                        self.after(0, lambda: self.arm_btn.configure(text="Disarm", fg_color="#C62828", hover_color="#b71c1c"))
+                        self.after(0, lambda: self.status_lbl.configure(text=f"Armed ({self.bp_desc})", text_color="#FFD740"))
+                        self.after(0, lambda: self.app.log_msg(f"Armed {self.bp_desc} at {self.active_bp_addr}"))
+                        self.after(200, self.poll_for_halt)
+                    except Exception as e:
+                        self.after(0, lambda: self.app.log_msg(f"Breakpoint Arm ERROR: {e}"))
+
+            threading.Thread(target=_arm_task, daemon=True).start()
+        else:
+            self.disarm_breakpoint()
+
+    def disarm_breakpoint(self, resume_after=False):
+        clear_cmd = getattr(self, "clear_cmd", None)
+        self.is_armed = False
+        self.is_halted_here = False
+
+        def _disarm_task():
+            with self.app.jtag_lock:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(2.0)
+                        s.connect(("localhost", 6666))
+                        def send_and_wait(command):
+                            s.sendall(command.encode('utf-8') + b'\x1a')
+                            resp = b""
+                            while b'\x1a' not in resp:
+                                chunk = s.recv(1024)
+                                if not chunk: break
+                                resp += chunk
+                            return resp.decode('utf-8').strip('\x1a\r\n')
+
+                        state = send_and_wait("[[target current] curstate]")
+                        was_running = ("running" in state)
+                        if was_running:
+                            send_and_wait("halt; wait_halt")
+                        if clear_cmd:
+                            send_and_wait(clear_cmd)
+                        if was_running or resume_after:
+                            send_and_wait("resume")
+                            self.app.target_halted_at_bp = False
+                except Exception:
+                    pass
+
+            if self.winfo_exists():
+                self.after(0, lambda: self.arm_btn.configure(text="Arm Breakpoint", fg_color="#00838F", hover_color="#006064"))
+                self.after(0, lambda: self.resume_btn.configure(state="disabled"))
+                self.after(0, lambda: self.status_lbl.configure(text="Status: Disarmed", text_color="gray"))
+                self.after(0, lambda: self.app.log_msg("Breakpoint disarmed."))
+
+        threading.Thread(target=_disarm_task, daemon=True).start()
+
+    def poll_for_halt(self):
+        if not self.winfo_exists() or not self.is_armed or self.is_halted_here:
+            return
+
+        def _check_task():
+            hit_detected = False
+            with self.app.jtag_lock:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(1.5)
+                        s.connect(("localhost", 6666))
+                        def send_and_wait(command):
+                            s.sendall(command.encode('utf-8') + b'\x1a')
+                            resp = b""
+                            while b'\x1a' not in resp:
+                                chunk = s.recv(1024)
+                                if not chunk: break
+                                resp += chunk
+                            return resp.decode('utf-8').strip('\x1a\r\n')
+
+                        state = send_and_wait("[[target current] curstate]")
+                        if "halted" in state:
+                            hit_detected = True
+                            self.is_halted_here = True
+                            self.app.target_halted_at_bp = True
+                except Exception:
+                    pass
+
+            if hit_detected:
+                self.after(0, self.on_breakpoint_hit)
+            elif self.is_armed and self.winfo_exists():
+                self.after(200, self.poll_for_halt)
+
+        threading.Thread(target=_check_task, daemon=True).start()
+
+    def on_breakpoint_hit(self):
+        if not self.winfo_exists():
+            return
+        # 1. Disable Auto-Poll on all other widgets immediately
+        self.app.disable_all_auto_poll()
+        self.resume_btn.configure(state="normal")
+        self.status_lbl.configure(text="HALTED! Reading variables...", text_color="#FF5252")
+
+        # 2. Read PC and snapshot all variables in background
+        def _snapshot_task():
+            pc_str = "unknown"
+            results = {}
+            with self.app.jtag_lock:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(4.0)
+                        s.connect(("localhost", 6666))
+                        def send_and_wait(command):
+                            s.sendall(command.encode('utf-8') + b'\x1a')
+                            resp = b""
+                            while b'\x1a' not in resp:
+                                chunk = s.recv(1024)
+                                if not chunk: break
+                                resp += chunk
+                            return resp.decode('utf-8').strip('\x1a\r\n')
+
+                        pc_out = send_and_wait("reg pc")
+                        m_pc = re.search(r'0x[0-9a-fA-F]+', pc_out)
+                        if m_pc:
+                            pc_str = m_pc.group(0)
+
+                        for var_name, info in self.var_rows.items():
+                            out = send_and_wait(f"mdw {info['addr']}")
+                            m_val = re.search(r':\s*([0-9a-fA-F]+)', out)
+                            if m_val:
+                                results[var_name] = int(m_val.group(1), 16)
+                except Exception as e:
+                    self.after(0, lambda: self.app.log_msg(f"Snapshot Read ERROR: {e}"))
+
+            def _apply_ui():
+                if not self.winfo_exists():
+                    return
+                for var_name, raw_val in results.items():
+                    if var_name in self.var_rows:
+                        self.var_rows[var_name]["raw"] = raw_val
+                        self.update_single_row_display(var_name)
+                self.status_lbl.configure(text=f"HALTED @ PC={pc_str}", text_color="#FF5252")
+                self.app.log_msg(f"Breakpoint hit at PC={pc_str}. Auto-poll disabled; updated {len(results)} variables.")
+                self.app.refresh_other_widgets_halted()
+
+            self.after(0, _apply_ui)
+
+        threading.Thread(target=_snapshot_task, daemon=True).start()
+
+    def resume_target(self):
+        if not self.is_halted_here:
+            return
+        keep = self.keep_armed.get()
+
+        def _resume_task():
+            with self.app.jtag_lock:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(2.0)
+                        s.connect(("localhost", 6666))
+                        def send_and_wait(command):
+                            s.sendall(command.encode('utf-8') + b'\x1a')
+                            resp = b""
+                            while b'\x1a' not in resp:
+                                chunk = s.recv(1024)
+                                if not chunk: break
+                                resp += chunk
+                            return resp.decode('utf-8').strip('\x1a\r\n')
+
+                        # Remove trigger, single-step past the halted instruction, optionally re-arm, and resume
+                        send_and_wait(self.clear_cmd)
+                        send_and_wait("step")
+                        if keep:
+                            send_and_wait(self.set_cmd)
+                        send_and_wait("resume")
+
+                    self.app.target_halted_at_bp = False
+                    self.is_halted_here = False
+
+                    def _update_ui():
+                        if not self.winfo_exists():
+                            return
+                        self.resume_btn.configure(state="disabled")
+                        if keep:
+                            self.status_lbl.configure(text=f"Armed ({self.bp_desc})", text_color="#FFD740")
+                            self.app.log_msg("Target resumed (breakpoint re-armed).")
+                            self.after(200, self.poll_for_halt)
+                        else:
+                            self.is_armed = False
+                            self.arm_btn.configure(text="Arm Breakpoint", fg_color="#00838F", hover_color="#006064")
+                            self.status_lbl.configure(text="Status: Disarmed", text_color="gray")
+                            self.app.log_msg("Target resumed (breakpoint disarmed).")
+
+                    self.after(0, _update_ui)
+                except Exception as e:
+                    self.after(0, lambda: self.app.log_msg(f"Resume ERROR: {e}"))
+
+        threading.Thread(target=_resume_task, daemon=True).start()
+
+    def destroy(self):
+        if self.is_armed:
+            self.disarm_breakpoint()
+        super().destroy()
+
+
+class BreakOnFuncWidget(BaseBreakpointWidget):
+    # --- 1. BREAK ON FUNCTION WIDGET ---
+    def __init__(self, parent, app):
+        self.func_name = ctk.StringVar(value="main")
+        super().__init__(parent, app, border_color="#00ACC1")
+
+    def build_specific_controls(self, parent):
+        ctk.CTkLabel(parent, text="Break on Func | Function / Addr:").grid(row=0, column=0, padx=(5, 5))
+        func_list = sorted(self.app.func_symbols.keys()) if self.app.func_symbols else ["main"]
+        self.func_combo = ctk.CTkComboBox(parent, variable=self.func_name, values=func_list, width=240)
+        self.func_combo.grid(row=0, column=1, padx=5)
+
+        ctk.CTkButton(parent, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).grid(row=0, column=2, padx=(15, 5))
+
+    def on_symbol_files_updated(self):
+        super().on_symbol_files_updated()
+        func_list = sorted(self.app.func_symbols.keys()) if self.app.func_symbols else ["main"]
+        self.func_combo.configure(values=func_list)
+
+    def resolve_trigger_command(self):
+        target = self.func_name.get().strip()
+        addr = self.app.func_symbols.get(target) or self.get_resolved_addr(target)
+        if not addr:
+            self.app.log_msg(f"Break on Func Error: '{target}' not found in .map file or valid hex.")
+            return None
+        return (addr, f"bp {addr} 2 hw", f"rbp {addr}", f"Func: {target} @ {addr}")
+
+    def get_state(self):
+        return {"widget_type": "bp_func", "func_name": self.func_name.get(), "global_fmt": self.global_fmt.get()}
+
+    def set_state(self, state):
+        self.func_name.set(state.get("func_name", "main"))
+        fmt = state.get("global_fmt", "Hex")
+        self.global_fmt.set(fmt)
+        self.apply_global_format(fmt)
+
+
+class BreakOnLineWidget(BaseBreakpointWidget):
+    # --- 2. BREAK ON SOURCE LINE WIDGET (USES OPTIONAL .LST FILE OR HEX) ---
+    def __init__(self, parent, app):
+        self.line_spec = ctk.StringVar(value="main.c:100")
+        super().__init__(parent, app, border_color="#26A69A")
+
+    def build_specific_controls(self, parent):
+        ctk.CTkLabel(parent, text="Break on Line | file.c:line or Hex:").grid(row=0, column=0, padx=(5, 5))
+        line_list = sorted(self.app.lst_table.keys()) if self.app.lst_table else ["main.c:100"]
+        self.line_combo = ctk.CTkComboBox(parent, variable=self.line_spec, values=line_list, width=260)
+        self.line_combo.grid(row=0, column=1, padx=5)
+
+        self.resolved_lbl = ctk.CTkLabel(parent, text="(Load optional .lst file or enter 0x addr)", text_color="gray", font=("Consolas", 11))
+        self.resolved_lbl.grid(row=0, column=2, padx=10)
+
+        ctk.CTkButton(parent, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).grid(row=0, column=3, padx=(10, 5))
+
+    def on_symbol_files_updated(self):
+        super().on_symbol_files_updated()
+        if self.app.lst_table:
+            keys = sorted(self.app.lst_table.keys())
+            self.line_combo.configure(values=keys)
+            self.resolved_lbl.configure(text=f"(.lst ready: {len(keys)} lines)", text_color="#4CAF50")
+
+    def resolve_trigger_command(self):
+        spec = self.line_spec.get().strip()
+        addr = None
+        if spec in self.app.lst_table:
+            addr = self.app.lst_table[spec]
+        else:
+            # Try matching basename:line case-insensitively
+            for k, v in self.app.lst_table.items():
+                if k.lower() == spec.lower():
+                    addr = v
+                    break
+            if not addr:
+                addr = self.get_resolved_addr(spec)
+
+        if not addr:
+            self.app.log_msg(f"Break on Line Error: Cannot resolve '{spec}'. Load optional .lst file or enter hex address.")
+            return None
+        self.resolved_lbl.configure(text=f"Resolved -> {addr}", text_color="#00E676")
+        return (addr, f"bp {addr} 2 hw", f"rbp {addr}", f"Line: {spec} @ {addr}")
+
+    def get_state(self):
+        return {"widget_type": "bp_line", "line_spec": self.line_spec.get(), "global_fmt": self.global_fmt.get()}
+
+    def set_state(self, state):
+        self.line_spec.set(state.get("line_spec", "main.c:100"))
+        fmt = state.get("global_fmt", "Hex")
+        self.global_fmt.set(fmt)
+        self.apply_global_format(fmt)
+
+
+class BreakOnVarWidget(BaseBreakpointWidget):
+    # --- 3. BREAK ON VARIABLE WATCHPOINT WIDGET ---
+    def __init__(self, parent, app):
+        self.var_target = ctk.StringVar(value="motor_speed")
+        self.wp_mode = ctk.StringVar(value="w")
+        self.wp_len = ctk.StringVar(value="4")
+        super().__init__(parent, app, border_color="#FF7043")
+
+    def build_specific_controls(self, parent):
+        ctk.CTkLabel(parent, text="Break on Var | Var / Addr:").grid(row=0, column=0, padx=(5, 5))
+        var_list = sorted(self.app.var_symbols.keys()) if self.app.var_symbols else ["motor_speed"]
+        self.var_combo = ctk.CTkComboBox(parent, variable=self.var_target, values=var_list, width=200)
+        self.var_combo.grid(row=0, column=1, padx=5)
+
+        ctk.CTkLabel(parent, text="Access:").grid(row=0, column=2, padx=(10, 2))
+        ctk.CTkComboBox(parent, variable=self.wp_mode, values=["w", "r", "a"], width=65).grid(row=0, column=3, padx=2)
+
+        ctk.CTkLabel(parent, text="Bytes:").grid(row=0, column=4, padx=(10, 2))
+        ctk.CTkComboBox(parent, variable=self.wp_len, values=["1", "2", "4"], width=65).grid(row=0, column=5, padx=2)
+
+        ctk.CTkButton(parent, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).grid(row=0, column=6, padx=(15, 5))
+
+    def on_symbol_files_updated(self):
+        super().on_symbol_files_updated()
+        var_list = sorted(self.app.var_symbols.keys()) if self.app.var_symbols else ["motor_speed"]
+        self.var_combo.configure(values=var_list)
+
+    def resolve_trigger_command(self):
+        target = self.var_target.get().strip()
+        addr = self.get_resolved_addr(target)
+        if not addr:
+            self.app.log_msg(f"Break on Var Error: '{target}' is not a valid .map symbol or hex address.")
+            return None
+        mode = self.wp_mode.get().strip()
+        length = self.wp_len.get().strip()
+        return (addr, f"wp {addr} {length} {mode}", f"rwp {addr}", f"Var WP({mode}): {target} @ {addr}")
+
+    def get_state(self):
+        return {
+            "widget_type": "bp_var",
+            "var_target": self.var_target.get(),
+            "wp_mode": self.wp_mode.get(),
+            "wp_len": self.wp_len.get(),
+            "global_fmt": self.global_fmt.get()
+        }
+
+    def set_state(self, state):
+        self.var_target.set(state.get("var_target", "motor_speed"))
+        self.wp_mode.set(state.get("wp_mode", "w"))
+        self.wp_len.set(state.get("wp_len", "4"))
+        fmt = state.get("global_fmt", "Hex")
+        self.global_fmt.set(fmt)
+        self.apply_global_format(fmt)
+
 
 class ModernOpenOCD_GUI(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("PolarFire Live Tuner & Data Logger")
-        self.geometry("1100x800")
-        self.symbol_table = {}
+        self.title("PolarFire Live Tuner & Telemetry Dashboard")
+        self.geometry("1150x860")
+
+        self.symbol_table = {}   # All symbols: {name: addr_hex}
+        self.var_symbols = {}    # RAM / Data symbols: {name: addr_hex}
+        self.func_symbols = {}   # Code / .text symbols: {name: addr_hex}
+        self.lst_table = {}      # Disassembly line map: {"file.c:line": addr_hex}
+
+        self.jtag_lock = threading.Lock()
+        self.target_halted_at_bp = False
         self.ocd_process = None
         
         self.ocd_exe_path = ctk.StringVar()
@@ -869,26 +1455,18 @@ class ModernOpenOCD_GUI(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         
         self.build_ui()
-        self.log_msg("Ready. Select OpenOCD settings, or just load a .map file if OpenOCD is already running.")
+        self.log_msg("Ready. Load a .map file (and optional .lst file for Break on Line).")
 
     def build_ui(self):
         ocd_frame = ctk.CTkFrame(self, fg_color="#1E1E1E", border_width=1, border_color="#555555")
         ocd_frame.pack(fill="x", padx=20, pady=(15, 5))
-
-        footer = ctk.CTkLabel(
-        self, 
-        text="Live Memory Tuner | Developed by Leonardo Di Carlo | GitHub: https://github.com/eppidei/RiscVLiveDebugger", 
-        text_color="#666666", 
-        font=("Consolas", 10)
-        )
-        footer.pack(side="bottom", pady=2)
         
         ctk.CTkLabel(ocd_frame, text="OpenOCD Exe:").grid(row=0, column=0, padx=10, pady=5)
-        ctk.CTkEntry(ocd_frame, textvariable=self.ocd_exe_path, width=250).grid(row=0, column=1, padx=5, pady=5)
+        ctk.CTkEntry(ocd_frame, textvariable=self.ocd_exe_path, width=240).grid(row=0, column=1, padx=5, pady=5)
         ctk.CTkButton(ocd_frame, text="Browse", width=60, command=self.browse_exe).grid(row=0, column=2, padx=5, pady=5)
         
         ctk.CTkLabel(ocd_frame, text="Main CFG:").grid(row=0, column=3, padx=10, pady=5)
-        ctk.CTkEntry(ocd_frame, textvariable=self.ocd_cfg_path, width=250).grid(row=0, column=4, padx=5, pady=5)
+        ctk.CTkEntry(ocd_frame, textvariable=self.ocd_cfg_path, width=240).grid(row=0, column=4, padx=5, pady=5)
         ctk.CTkButton(ocd_frame, text="Browse", width=60, command=self.browse_cfg).grid(row=0, column=5, padx=5, pady=5)
 
         self.btn_start_ocd = ctk.CTkButton(ocd_frame, text="Start OpenOCD", fg_color="#00695C", hover_color="#004D40", command=self.toggle_openocd)
@@ -899,32 +1477,65 @@ class ModernOpenOCD_GUI(ctk.CTk):
         file_frame = ctk.CTkFrame(self, fg_color="transparent")
         file_frame.pack(fill="x", padx=20, pady=5)
         
-        ctk.CTkButton(file_frame, text="Upload .map File", width=120, command=self.load_map_file).pack(side="left")
-        self.map_label = ctk.CTkLabel(file_frame, text="No map file loaded.", text_color="gray")
-        self.map_label.pack(side="left", padx=15)
+        ctk.CTkButton(file_frame, text="Upload .map File", width=125, command=self.load_map_file).pack(side="left")
+        self.map_label = ctk.CTkLabel(file_frame, text="No .map loaded.", text_color="gray")
+        self.map_label.pack(side="left", padx=(8, 20))
+
+        ctk.CTkButton(file_frame, text="Upload .lst File (Opt)", width=145, fg_color="#37474F", hover_color="#263238", command=self.load_lst_file).pack(side="left")
+        self.lst_label = ctk.CTkLabel(file_frame, text="Optional (for Break on Line)", text_color="gray")
+        self.lst_label.pack(side="left", padx=8)
         
         ctk.CTkButton(file_frame, text="Save Layout", width=90, fg_color="#555555", command=self.save_layout).pack(side="right")
         ctk.CTkButton(file_frame, text="Load Layout", width=90, fg_color="#555555", command=self.load_layout).pack(side="right", padx=10)
         
         add_frame = ctk.CTkFrame(self, fg_color="transparent")
-        add_frame.pack(fill="x", padx=20, pady=(0, 10))
+        add_frame.pack(fill="x", padx=20, pady=(2, 10))
 
-        ctk.CTkButton(add_frame, text="+ Read Var", width=90, fg_color="#0277BD", hover_color="#01579B", 
-                      command=lambda: ReadMonitor(self.scrollable_frame, self)).pack(side="left", padx=(0, 10))
-        ctk.CTkButton(add_frame, text="+ Write Slider", width=90, fg_color="#2E7D32", hover_color="#1B5E20", 
-                      command=lambda: VarSlider(self.scrollable_frame, self)).pack(side="left", padx=(0, 10))
-        ctk.CTkButton(add_frame, text="+ Mem Plotter", width=90, fg_color="#8E24AA", hover_color="#6A1B9A", 
-                      command=lambda: MemBlockPlotter(self.scrollable_frame, self)).pack(side="left", padx=(0, 10))
-        ctk.CTkButton(add_frame, text="+ Mem Loader", width=90, fg_color="#F57C00", hover_color="#E65100", 
-                      command=lambda: MemFileLoader(self.scrollable_frame, self)).pack(side="left", padx=(0, 10))
-        ctk.CTkButton(add_frame, text="+ Alive Light", width=90, fg_color="#FBC02D", hover_color="#F9A825", text_color="black", 
-                      command=lambda: AliveLightWidget(self.scrollable_frame, self)).pack(side="left")
+        ctk.CTkButton(add_frame, text="+ Read Var", width=95, fg_color="#0277BD", hover_color="#01579B", 
+                      command=lambda: ReadMonitor(self.scrollable_frame, self)).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(add_frame, text="+ Write Slider", width=100, fg_color="#2E7D32", hover_color="#1B5E20", 
+                      command=lambda: VarSlider(self.scrollable_frame, self)).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(add_frame, text="+ Mem Plotter", width=100, fg_color="#8E24AA", hover_color="#6A1B9A", 
+                      command=lambda: MemBlockPlotter(self.scrollable_frame, self)).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(add_frame, text="+ Mem Loader", width=100, fg_color="#F57C00", hover_color="#E65100", 
+                      command=lambda: MemFileLoader(self.scrollable_frame, self)).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(add_frame, text="+ Alive Light", width=95, fg_color="#FBC02D", hover_color="#F9A825", text_color="black", 
+                      command=lambda: AliveLightWidget(self.scrollable_frame, self)).pack(side="left", padx=(0, 16))
+
+        # --- 3 NEW BREAKPOINT WIDGET BUTTONS ---
+        ctk.CTkButton(add_frame, text="+ Break on Func", width=115, fg_color="#00838F", hover_color="#006064",
+                      command=lambda: BreakOnFuncWidget(self.scrollable_frame, self)).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(add_frame, text="+ Break on Line", width=115, fg_color="#00695C", hover_color="#004D40",
+                      command=lambda: BreakOnLineWidget(self.scrollable_frame, self)).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(add_frame, text="+ Break on Var", width=115, fg_color="#D84315", hover_color="#BF360C",
+                      command=lambda: BreakOnVarWidget(self.scrollable_frame, self)).pack(side="left")
 
         self.scrollable_frame = ctk.CTkScrollableFrame(self, corner_radius=10)
         self.scrollable_frame.pack(side="top", fill="both", expand=True, padx=20, pady=5)
 
         self.log_text = ctk.CTkTextbox(self, height=100, state="disabled", font=("Consolas", 12))
         self.log_text.pack(pady=15, padx=20, fill="x")
+
+    def disable_all_auto_poll(self):
+        """Disables Auto Poll on all instantiated widgets when a breakpoint is hit."""
+        for widget in self.scrollable_frame.winfo_children():
+            if hasattr(widget, "auto_poll") and widget.auto_poll.get():
+                widget.auto_poll.set(False)
+                if isinstance(widget, AliveLightWidget):
+                    widget.toggle_poll()
+
+    def refresh_other_widgets_halted(self):
+        """Updates any active ReadMonitor, AliveLight, or MemBlockPlotter widgets once while halted."""
+        for widget in self.scrollable_frame.winfo_children():
+            if isinstance(widget, (ReadMonitor, AliveLightWidget)):
+                widget.execute_read(halted_only=True)
+            elif isinstance(widget, MemBlockPlotter):
+                widget.execute_dump(halted_only=True)
+
+    def notify_symbol_files_updated(self):
+        for widget in self.scrollable_frame.winfo_children():
+            if hasattr(widget, "on_symbol_files_updated"):
+                widget.on_symbol_files_updated()
 
     def browse_exe(self):
         fp = filedialog.askopenfilename(title="Select openocd.exe", filetypes=[("Executable", "*.exe"), ("All Files", "*.*")])
@@ -948,7 +1559,6 @@ class ModernOpenOCD_GUI(ctk.CTk):
             
             try:
                 if os.name == 'nt':
-                    # Launch OpenOCD in a new console window and colorize Error/Warn/Info lines live
                     ps_script = (
                         f"$host.UI.RawUI.WindowTitle = 'OpenOCD Live Console'; "
                         f"& '{exe}' -s '{cfg_dir}' -f '{cfg_file}' 2>&1 | ForEach-Object {{ "
@@ -958,11 +1568,7 @@ class ModernOpenOCD_GUI(ctk.CTk):
                         f"else {{ Write-Host $_ -ForegroundColor Gray }} }}"
                     )
                     cmd = ["powershell", "-NoLogo", "-NoExit", "-Command", ps_script]
-                    self.ocd_process = subprocess.Popen(
-                        cmd,
-                        cwd=cfg_dir,
-                        creationflags=subprocess.CREATE_NEW_CONSOLE
-                    )
+                    self.ocd_process = subprocess.Popen(cmd, cwd=cfg_dir, creationflags=subprocess.CREATE_NEW_CONSOLE)
                 else:
                     cmd = [exe, "-s", cfg_dir, "-f", cfg_file]
                     self.ocd_process = subprocess.Popen(cmd, cwd=cfg_dir)
@@ -979,7 +1585,6 @@ class ModernOpenOCD_GUI(ctk.CTk):
     def stop_openocd_process(self):
         if self.ocd_process:
             if os.name == 'nt':
-                # /T kills both the PowerShell wrapper and the child openocd.exe process
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(self.ocd_process.pid)],
                     stdout=subprocess.DEVNULL,
@@ -990,38 +1595,121 @@ class ModernOpenOCD_GUI(ctk.CTk):
                 self.ocd_process.wait()
             self.ocd_process = None
 
+    def reset_target(self):
+        def _task():
+            with self.jtag_lock:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(2.0)
+                        s.connect(("localhost", 6666))
+                        s.sendall("rbp all; rwp all; reset run\x1a".encode('utf-8'))
+                        self.target_halted_at_bp = False
+                        self.after(0, lambda: self.log_msg("Cleared triggers and sent 'reset run' to target."))
+                except Exception as e:
+                    self.after(0, lambda: self.log_msg(f"Reset failed (Is OpenOCD running?): {e}"))
+        threading.Thread(target=_task, daemon=True).start()
+
     def on_closing(self):
         self.stop_openocd_process()
         self.destroy()
-
-    def reset_target(self):
-        def _task():
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(2.0)
-                    s.connect(("localhost", 6666))
-                    s.sendall("reset run\x1a".encode('utf-8'))
-                    self.after(0, lambda: self.log_msg("Sent 'reset run' command to target."))
-            except Exception as e:
-                self.after(0, lambda: self.log_msg(f"Reset failed (Is OpenOCD running?): {e}"))
-        threading.Thread(target=_task, daemon=True).start()
 
     def load_map_file(self):
         filepath = filedialog.askopenfilename(filetypes=[("Map Files", "*.map"), ("All Files", "*.*")])
         if not filepath: return
         self.symbol_table.clear()
+        self.var_symbols.clear()
+        self.func_symbols.clear()
+
+        current_section = ""
+        ignored_prefixes = ("__", "_start", "_end", "_edata", "_fbss", "_sdata", "_etext", "_heap", "_stack")
+
         try:
-            with open(filepath, 'r') as f:
+            with open(filepath, 'r', errors='ignore') as f:
                 for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 2 and parts[0].startswith("0x"):
-                        addr, sym = parts[0], parts[-1] 
-                        if re.match(r'^[a-zA-Z_]\w*$', sym):
-                            self.symbol_table[sym] = addr
-            self.map_label.configure(text=f"Loaded: {filepath.split('/')[-1]} ({len(self.symbol_table)} vars)", text_color="#4CAF50")
-            self.log_msg(f"Map file loaded. Found {len(self.symbol_table)} variables.")
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+
+                    # Track linker section headers (.text, .data, .bss, .sdata, .sbss, .uncached_lsram, COMMON)
+                    sec_match = re.match(r'^(\.[a-zA-Z0-9_.*]+|COMMON)\b', stripped)
+                    if sec_match:
+                        current_section = sec_match.group(1)
+
+                    parts = stripped.split()
+                    if len(parts) >= 2:
+                        addr_token = None
+                        sym_token = parts[-1]
+                        if parts[0].startswith("0x"):
+                            addr_token = parts[0]
+                        elif len(parts) >= 3 and parts[1].startswith("0x"):
+                            addr_token = parts[1]
+
+                        if addr_token and re.match(r'^[a-zA-Z_]\w*$', sym_token):
+                            if sym_token.startswith(ignored_prefixes):
+                                continue
+                            try:
+                                addr_int = int(addr_token, 16)
+                                if addr_int == 0:
+                                    continue
+                                norm_addr = f"0x{addr_int:08X}"
+                            except ValueError:
+                                continue
+
+                            self.symbol_table[sym_token] = norm_addr
+                            if any(k in current_section for k in (".data", ".bss", ".sdata", ".sbss", ".uncached", "COMMON", ".noinit")):
+                                self.var_symbols[sym_token] = norm_addr
+                            elif ".text" in current_section:
+                                self.func_symbols[sym_token] = norm_addr
+
+            # Fallback if map file had no standard section headers
+            if not self.var_symbols:
+                self.var_symbols.update(self.symbol_table)
+            if not self.func_symbols:
+                self.func_symbols.update(self.symbol_table)
+
+            fname = os.path.basename(filepath)
+            self.map_label.configure(
+                text=f"{fname} ({len(self.var_symbols)} vars, {len(self.func_symbols)} funcs)",
+                text_color="#4CAF50"
+            )
+            self.log_msg(f"Loaded .map: {len(self.var_symbols)} RAM variables, {len(self.func_symbols)} functions.")
+            self.notify_symbol_files_updated()
         except Exception as e:
             self.log_msg(f"ERROR reading map file: {e}")
+
+    def load_lst_file(self):
+        filepath = filedialog.askopenfilename(filetypes=[("Disassembly Listing", "*.lst *.txt"), ("All Files", "*.*")])
+        if not filepath: return
+        self.lst_table.clear()
+
+        pending_line_key = None
+        try:
+            with open(filepath, 'r', errors='ignore') as f:
+                for line in f:
+                    stripped = line.strip()
+                    # Match source file:line markers (e.g. /path/main.c:142 or C:\path\main.c:142)
+                    m_src = re.match(r'^(.+?\.[cChHsS](?:pp)?):(\d+)', stripped)
+                    if m_src:
+                        base_file = os.path.basename(m_src.group(1))
+                        line_num = m_src.group(2)
+                        pending_line_key = f"{base_file}:{line_num}"
+                        continue
+
+                    # Match first following instruction address (e.g. "  800014a8:  00c7a783   lw a5,12(a5)")
+                    if pending_line_key:
+                        m_inst = re.match(r'^\s*([0-9a-fA-F]{4,16}):\s+[0-9a-fA-F]{4,8}\s+', line)
+                        if m_inst:
+                            addr_int = int(m_inst.group(1), 16)
+                            if pending_line_key not in self.lst_table:
+                                self.lst_table[pending_line_key] = f"0x{addr_int:08X}"
+                            pending_line_key = None
+
+            fname = os.path.basename(filepath)
+            self.lst_label.configure(text=f"{fname} ({len(self.lst_table)} lines)", text_color="#4CAF50")
+            self.log_msg(f"Loaded optional .lst file: mapped {len(self.lst_table)} source lines to instruction addresses.")
+            self.notify_symbol_files_updated()
+        except Exception as e:
+            self.log_msg(f"ERROR reading .lst file: {e}")
 
     def save_layout(self):
         filepath = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Layouts", "*.json")])
@@ -1048,6 +1736,10 @@ class ModernOpenOCD_GUI(ctk.CTk):
                 elif w_type == "plotter": new_w = MemBlockPlotter(self.scrollable_frame, self)
                 elif w_type == "loader": new_w = MemFileLoader(self.scrollable_frame, self)
                 elif w_type == "alive_light": new_w = AliveLightWidget(self.scrollable_frame, self)
+                elif w_type == "bp_func": new_w = BreakOnFuncWidget(self.scrollable_frame, self)
+                elif w_type == "bp_line": new_w = BreakOnLineWidget(self.scrollable_frame, self)
+                elif w_type == "bp_var": new_w = BreakOnVarWidget(self.scrollable_frame, self)
+                else: continue
                 new_w.set_state(state)
             self.log_msg(f"Layout loaded successfully: {len(layout_data)} widgets.")
         except Exception as e: self.log_msg(f"ERROR loading layout: {e}")
