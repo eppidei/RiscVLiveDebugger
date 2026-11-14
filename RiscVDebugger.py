@@ -23,6 +23,10 @@ class BaseWidget(ctk.CTkFrame):
         addr_str = addr_str.strip()
         if addr_str in self.app.symbol_table:
             return self.app.symbol_table[addr_str]
+        if addr_str in self.app.func_symbols:
+            return self.app.func_symbols[addr_str]
+        if addr_str in self.app.var_symbols:
+            return self.app.var_symbols[addr_str]
         try:
             int(addr_str, 16)
             return addr_str if addr_str.startswith("0x") else "0x" + addr_str
@@ -320,7 +324,6 @@ class ReadMonitor(BaseWidget):
                         else:
                             state = send_and_wait("[[target current] curstate]")
                             if "halted" in state:
-                                # Target just hit a breakpoint; do not resume!
                                 self.after(0, self.app.disable_all_auto_poll)
                                 read_output = send_and_wait(f"{mem_cmd} {addr}")
                             else:
@@ -898,9 +901,10 @@ class BaseBreakpointWidget(BaseWidget):
     # --- SHARED BASE CLASS FOR ALL 3 BREAKPOINT WIDGETS ---
     FORMATS = ["Hex", "uint32", "int32", "uint16", "int16", "uint8", "int8", "float", "bin"]
 
-    def __init__(self, parent, app, border_color="#00ACC1"):
+    def __init__(self, parent, app, border_color="#00ACC1", selector_title="Select Target"):
         super().__init__(parent, corner_radius=10, border_width=2, border_color=border_color)
         self.app = app
+        self.selector_title = selector_title
         self.pack(fill="x", pady=10, padx=10)
 
         self.is_armed = False
@@ -909,17 +913,19 @@ class BaseBreakpointWidget(BaseWidget):
         self.keep_armed = ctk.BooleanVar(value=True)
         self.global_fmt = ctk.StringVar(value="Hex")
         self.filter_var = ctk.StringVar(value="")
-        self.var_rows = {}  # {var_name: {"addr": str, "raw": int|None, "fmt_var": StringVar, "val_lbl": CTkLabel, "frame": CTkFrame}}
+        self.selector_filter_var = ctk.StringVar(value="")
 
+        self.selector_buttons = {}  # {key: {"btn": CTkButton, "addr": str}}
+        self.var_rows = {}          # {var_name: {"addr": str, "raw": int|None, "fmt_var": StringVar, "val_lbl": CTkLabel, "frame": CTkFrame}}
+
+        # 1. Top Control Row (Target Entry + Extra Options + Arm/Resume)
         self.top_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.top_frame.pack(fill="x", padx=10, pady=(10, 5))
-
-        # Subclasses populate self.top_frame columns 0..N
+        self.top_frame.pack(fill="x", padx=10, pady=(10, 4))
         self.build_specific_controls(self.top_frame)
 
-        # Status & Action Bar
+        # 2. Status & Action Bar
         ctrl_frame = ctk.CTkFrame(self, fg_color="transparent")
-        ctrl_frame.pack(fill="x", padx=15, pady=(2, 5))
+        ctrl_frame.pack(fill="x", padx=15, pady=(2, 6))
 
         self.arm_btn = ctk.CTkButton(ctrl_frame, text="Arm Breakpoint", width=120, fg_color="#00838F", hover_color="#006064", command=self.toggle_arm)
         self.arm_btn.pack(side="left", padx=(0, 10))
@@ -932,36 +938,123 @@ class BaseBreakpointWidget(BaseWidget):
         self.status_lbl = ctk.CTkLabel(ctrl_frame, text="Status: Disarmed", font=("Consolas", 13, "bold"), text_color="gray")
         self.status_lbl.pack(side="left", padx=15)
 
-        # Variable List Header & Format Controls
-        list_hdr = ctk.CTkFrame(self, fg_color="#1A1A1A", corner_radius=6)
-        list_hdr.pack(fill="x", padx=15, pady=(5, 2))
+        # 3. Side-by-Side Split Container:
+        #    Left  = Scrollable Selector List (Functions / Lines / Watch Vars)
+        #    Right = Scrollable Variables Snapshot List (Updated on Breakpoint Hit)
+        split_frame = ctk.CTkFrame(self, fg_color="transparent")
+        split_frame.pack(fill="x", padx=12, pady=(2, 12))
+        split_frame.grid_columnconfigure(0, weight=2)
+        split_frame.grid_columnconfigure(1, weight=3)
 
-        ctk.CTkLabel(list_hdr, text="Variables Snapshot:", font=("Consolas", 12, "bold")).pack(side="left", padx=8, pady=4)
-        ctk.CTkLabel(list_hdr, text="Filter:").pack(side="left", padx=(10, 2))
-        filter_entry = ctk.CTkEntry(list_hdr, textvariable=self.filter_var, width=120, placeholder_text="var name...")
-        filter_entry.pack(side="left", padx=2, pady=4)
+        # --- LEFT PANE: SCROLLABLE TARGET SELECTOR ---
+        left_pane = ctk.CTkFrame(split_frame, fg_color="#181818", corner_radius=6)
+        left_pane.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+
+        left_hdr = ctk.CTkFrame(left_pane, fg_color="transparent")
+        left_hdr.pack(fill="x", padx=6, pady=4)
+        self.selector_title_lbl = ctk.CTkLabel(left_hdr, text=self.selector_title, font=("Consolas", 12, "bold"), text_color="#4DD0E1")
+        self.selector_title_lbl.pack(side="left", padx=4)
+
+        sel_filter_entry = ctk.CTkEntry(left_hdr, textvariable=self.selector_filter_var, width=110, placeholder_text="Search list...")
+        sel_filter_entry.pack(side="right", padx=4)
+        sel_filter_entry.bind("<KeyRelease>", lambda e: self.apply_selector_filter())
+
+        self.selector_scroll = ctk.CTkScrollableFrame(left_pane, height=175, corner_radius=5, fg_color="#1E1E1E")
+        self.selector_scroll.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # --- RIGHT PANE: SCROLLABLE ALL-VARIABLES SNAPSHOT ---
+        right_pane = ctk.CTkFrame(split_frame, fg_color="#181818", corner_radius=6)
+        right_pane.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+
+        right_hdr = ctk.CTkFrame(right_pane, fg_color="transparent")
+        right_hdr.pack(fill="x", padx=6, pady=4)
+
+        ctk.CTkLabel(right_hdr, text="Variables Snapshot on Hit:", font=("Consolas", 12, "bold")).pack(side="left", padx=4)
+        filter_entry = ctk.CTkEntry(right_hdr, textvariable=self.filter_var, width=105, placeholder_text="Filter var...")
+        filter_entry.pack(side="left", padx=6)
         filter_entry.bind("<KeyRelease>", lambda e: self.apply_filter())
 
-        ctk.CTkButton(list_hdr, text="Reload .map Vars", width=110, fg_color="#424242", hover_color="#616161", command=self.populate_var_rows).pack(side="right", padx=6, pady=4)
-        ctk.CTkComboBox(list_hdr, variable=self.global_fmt, values=self.FORMATS, width=90, command=self.apply_global_format).pack(side="right", padx=4, pady=4)
-        ctk.CTkLabel(list_hdr, text="Format All:").pack(side="right", padx=4)
+        ctk.CTkComboBox(right_hdr, variable=self.global_fmt, values=self.FORMATS, width=85, command=self.apply_global_format).pack(side="right", padx=4)
+        ctk.CTkLabel(right_hdr, text="Format All:").pack(side="right", padx=2)
 
-        # Compact Scrollable List of Variables
-        self.var_scroll = ctk.CTkScrollableFrame(self, height=175, corner_radius=6, fg_color="#1E1E1E")
-        self.var_scroll.pack(fill="x", padx=15, pady=(2, 12))
+        self.var_scroll = ctk.CTkScrollableFrame(right_pane, height=175, corner_radius=5, fg_color="#1E1E1E")
+        self.var_scroll.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
+        self.populate_selector_rows()
         self.populate_var_rows()
 
     def build_specific_controls(self, parent):
         pass
+
+    def get_selector_dict(self):
+        """Override in subclass: returns {symbol_or_line: addr_hex} to populate the left scrollable selector."""
+        return {}
+
+    def on_selector_item_clicked(self, key, addr):
+        """Override in subclass: sets the active target variable when user clicks an item in the left list."""
+        pass
+
+    def get_current_target_key(self):
+        return ""
 
     def resolve_trigger_command(self):
         """Override in subclass: returns (addr_hex, set_cmd, clear_cmd, description) or None."""
         return None
 
     def on_symbol_files_updated(self):
-        """Called by main GUI when .map or .lst files are reloaded."""
+        """Called by main GUI when .map or .lst files are loaded."""
+        self.populate_selector_rows()
         self.populate_var_rows()
+
+    def populate_selector_rows(self):
+        for child in self.selector_scroll.winfo_children():
+            child.destroy()
+        self.selector_buttons.clear()
+
+        items_dict = self.get_selector_dict()
+        if not items_dict:
+            ctk.CTkLabel(
+                self.selector_scroll,
+                text="Load .map (or .lst) file above\nto populate scrollable list.",
+                text_color="gray"
+            ).pack(pady=20)
+            return
+
+        current_sel = self.get_current_target_key()
+        for key in sorted(items_dict.keys()):
+            addr = items_dict[key]
+            is_sel = (key == current_sel)
+            btn = ctk.CTkButton(
+                self.selector_scroll,
+                text=f"{key:<28} {addr}",
+                font=("Consolas", 11),
+                anchor="w",
+                height=24,
+                fg_color="#0277BD" if is_sel else "transparent",
+                hover_color="#263238",
+                text_color="white" if is_sel else "#E0E0E0",
+                command=lambda k=key, a=addr: self._handle_selector_click(k, a)
+            )
+            btn.pack(fill="x", pady=1, padx=2)
+            self.selector_buttons[key] = {"btn": btn, "addr": addr}
+
+        self.apply_selector_filter()
+
+    def _handle_selector_click(self, key, addr):
+        self.on_selector_item_clicked(key, addr)
+        for k, info in self.selector_buttons.items():
+            if k == key:
+                info["btn"].configure(fg_color="#0277BD", text_color="white")
+            else:
+                info["btn"].configure(fg_color="transparent", text_color="#E0E0E0")
+
+    def apply_selector_filter(self):
+        query = self.selector_filter_var.get().strip().lower()
+        for key, info in self.selector_buttons.items():
+            if not query or query in key.lower() or query in info["addr"].lower():
+                info["btn"].pack(fill="x", pady=1, padx=2)
+            else:
+                info["btn"].pack_forget()
 
     def populate_var_rows(self):
         for child in self.var_scroll.winfo_children():
@@ -970,29 +1063,34 @@ class BaseBreakpointWidget(BaseWidget):
 
         source_vars = self.app.var_symbols if self.app.var_symbols else self.app.symbol_table
         if not source_vars:
-            ctk.CTkLabel(self.var_scroll, text="Load a .map file to populate the variable snapshot list.", text_color="gray").pack(pady=10)
+            ctk.CTkLabel(
+                self.var_scroll,
+                text="Load a .map file to populate\nthe variable snapshot list.",
+                text_color="gray"
+            ).pack(pady=20)
             return
 
         for var_name in sorted(source_vars.keys()):
             addr = source_vars[var_name]
             row = ctk.CTkFrame(self.var_scroll, fg_color="transparent")
-            row.pack(fill="x", pady=1, padx=4)
+            row.pack(fill="x", pady=1, padx=2)
 
-            ctk.CTkLabel(row, text=var_name, font=("Consolas", 12), width=210, anchor="w").pack(side="left", padx=(4, 8))
-            ctk.CTkLabel(row, text=addr, font=("Consolas", 11), text_color="#888888", width=105, anchor="w").pack(side="left", padx=4)
+            ctk.CTkLabel(row, text=var_name, font=("Consolas", 11), width=155, anchor="w").pack(side="left", padx=(2, 4))
+            ctk.CTkLabel(row, text=addr, font=("Consolas", 10), text_color="#888888", width=85, anchor="w").pack(side="left", padx=2)
 
-            val_lbl = ctk.CTkLabel(row, text="---", font=("Consolas", 13, "bold"), text_color="#00E676", width=180, anchor="w")
-            val_lbl.pack(side="left", padx=10)
+            val_lbl = ctk.CTkLabel(row, text="---", font=("Consolas", 12, "bold"), text_color="#00E676", width=130, anchor="w")
+            val_lbl.pack(side="left", padx=6)
 
             fmt_var = ctk.StringVar(value=self.global_fmt.get())
             fmt_box = ctk.CTkComboBox(
                 row,
                 variable=fmt_var,
                 values=self.FORMATS,
-                width=90,
+                width=82,
+                height=22,
                 command=lambda choice, vn=var_name: self.update_single_row_display(vn)
             )
-            fmt_box.pack(side="right", padx=4)
+            fmt_box.pack(side="right", padx=2)
 
             self.var_rows[var_name] = {
                 "addr": addr,
@@ -1008,7 +1106,7 @@ class BaseBreakpointWidget(BaseWidget):
         query = self.filter_var.get().strip().lower()
         for var_name, info in self.var_rows.items():
             if not query or query in var_name.lower():
-                info["frame"].pack(fill="x", pady=1, padx=4)
+                info["frame"].pack(fill="x", pady=1, padx=2)
             else:
                 info["frame"].pack_forget()
 
@@ -1181,12 +1279,10 @@ class BaseBreakpointWidget(BaseWidget):
     def on_breakpoint_hit(self):
         if not self.winfo_exists():
             return
-        # 1. Disable Auto-Poll on all other widgets immediately
         self.app.disable_all_auto_poll()
         self.resume_btn.configure(state="normal")
         self.status_lbl.configure(text="HALTED! Reading variables...", text_color="#FF5252")
 
-        # 2. Read PC and snapshot all variables in background
         def _snapshot_task():
             pc_str = "unknown"
             results = {}
@@ -1252,7 +1348,6 @@ class BaseBreakpointWidget(BaseWidget):
                                 resp += chunk
                             return resp.decode('utf-8').strip('\x1a\r\n')
 
-                        # Remove trigger, single-step past the halted instruction, optionally re-arm, and resume
                         send_and_wait(self.clear_cmd)
                         send_and_wait("step")
                         if keep:
@@ -1289,23 +1384,27 @@ class BaseBreakpointWidget(BaseWidget):
 
 
 class BreakOnFuncWidget(BaseBreakpointWidget):
-    # --- 1. BREAK ON FUNCTION WIDGET ---
+    # --- 1. BREAK ON FUNCTION WIDGET (SCROLL & CLICK FUNCTION SELECTOR) ---
     def __init__(self, parent, app):
         self.func_name = ctk.StringVar(value="main")
-        super().__init__(parent, app, border_color="#00ACC1")
+        super().__init__(parent, app, border_color="#00ACC1", selector_title="Select Function (.map):")
 
     def build_specific_controls(self, parent):
-        ctk.CTkLabel(parent, text="Break on Func | Function / Addr:").grid(row=0, column=0, padx=(5, 5))
-        func_list = sorted(self.app.func_symbols.keys()) if self.app.func_symbols else ["main"]
-        self.func_combo = ctk.CTkComboBox(parent, variable=self.func_name, values=func_list, width=240)
-        self.func_combo.grid(row=0, column=1, padx=5)
+        ctk.CTkLabel(parent, text="Break on Func | Selected Function / Hex:").pack(side="left", padx=(5, 5))
+        ctk.CTkEntry(parent, textvariable=self.func_name, width=220).pack(side="left", padx=5)
+        self.addr_preview = ctk.CTkLabel(parent, text="", font=("Consolas", 11), text_color="#4DD0E1")
+        self.addr_preview.pack(side="left", padx=10)
+        ctk.CTkButton(parent, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).pack(side="right", padx=5)
 
-        ctk.CTkButton(parent, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).grid(row=0, column=2, padx=(15, 5))
+    def get_selector_dict(self):
+        return self.app.func_symbols
 
-    def on_symbol_files_updated(self):
-        super().on_symbol_files_updated()
-        func_list = sorted(self.app.func_symbols.keys()) if self.app.func_symbols else ["main"]
-        self.func_combo.configure(values=func_list)
+    def get_current_target_key(self):
+        return self.func_name.get().strip()
+
+    def on_selector_item_clicked(self, key, addr):
+        self.func_name.set(key)
+        self.addr_preview.configure(text=f"-> {addr}")
 
     def resolve_trigger_command(self):
         target = self.func_name.get().strip()
@@ -1313,6 +1412,7 @@ class BreakOnFuncWidget(BaseBreakpointWidget):
         if not addr:
             self.app.log_msg(f"Break on Func Error: '{target}' not found in .map file or valid hex.")
             return None
+        self.addr_preview.configure(text=f"-> {addr}")
         return (addr, f"bp {addr} 2 hw", f"rbp {addr}", f"Func: {target} @ {addr}")
 
     def get_state(self):
@@ -1323,39 +1423,36 @@ class BreakOnFuncWidget(BaseBreakpointWidget):
         fmt = state.get("global_fmt", "Hex")
         self.global_fmt.set(fmt)
         self.apply_global_format(fmt)
+        self.populate_selector_rows()
 
 
 class BreakOnLineWidget(BaseBreakpointWidget):
-    # --- 2. BREAK ON SOURCE LINE WIDGET (USES OPTIONAL .LST FILE OR HEX) ---
+    # --- 2. BREAK ON SOURCE LINE WIDGET (SCROLL & CLICK .LST LINE SELECTOR) ---
     def __init__(self, parent, app):
         self.line_spec = ctk.StringVar(value="main.c:100")
-        super().__init__(parent, app, border_color="#26A69A")
+        super().__init__(parent, app, border_color="#26A69A", selector_title="Select Source Line (.lst):")
 
     def build_specific_controls(self, parent):
-        ctk.CTkLabel(parent, text="Break on Line | file.c:line or Hex:").grid(row=0, column=0, padx=(5, 5))
-        line_list = sorted(self.app.lst_table.keys()) if self.app.lst_table else ["main.c:100"]
-        self.line_combo = ctk.CTkComboBox(parent, variable=self.line_spec, values=line_list, width=260)
-        self.line_combo.grid(row=0, column=1, padx=5)
+        ctk.CTkLabel(parent, text="Break on Line | Selected file.c:line / Hex:").pack(side="left", padx=(5, 5))
+        ctk.CTkEntry(parent, textvariable=self.line_spec, width=220).pack(side="left", padx=5)
+        self.resolved_lbl = ctk.CTkLabel(parent, text="(Load optional .lst or enter 0x addr)", text_color="gray", font=("Consolas", 11))
+        self.resolved_lbl.pack(side="left", padx=10)
+        ctk.CTkButton(parent, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).pack(side="right", padx=5)
 
-        self.resolved_lbl = ctk.CTkLabel(parent, text="(Load optional .lst file or enter 0x addr)", text_color="gray", font=("Consolas", 11))
-        self.resolved_lbl.grid(row=0, column=2, padx=10)
+    def get_selector_dict(self):
+        return self.app.lst_table
 
-        ctk.CTkButton(parent, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).grid(row=0, column=3, padx=(10, 5))
+    def get_current_target_key(self):
+        return self.line_spec.get().strip()
 
-    def on_symbol_files_updated(self):
-        super().on_symbol_files_updated()
-        if self.app.lst_table:
-            keys = sorted(self.app.lst_table.keys())
-            self.line_combo.configure(values=keys)
-            self.resolved_lbl.configure(text=f"(.lst ready: {len(keys)} lines)", text_color="#4CAF50")
+    def on_selector_item_clicked(self, key, addr):
+        self.line_spec.set(key)
+        self.resolved_lbl.configure(text=f"-> {addr}", text_color="#00E676")
 
     def resolve_trigger_command(self):
         spec = self.line_spec.get().strip()
-        addr = None
-        if spec in self.app.lst_table:
-            addr = self.app.lst_table[spec]
-        else:
-            # Try matching basename:line case-insensitively
+        addr = self.app.lst_table.get(spec)
+        if not addr:
             for k, v in self.app.lst_table.items():
                 if k.lower() == spec.lower():
                     addr = v
@@ -1366,7 +1463,7 @@ class BreakOnLineWidget(BaseBreakpointWidget):
         if not addr:
             self.app.log_msg(f"Break on Line Error: Cannot resolve '{spec}'. Load optional .lst file or enter hex address.")
             return None
-        self.resolved_lbl.configure(text=f"Resolved -> {addr}", text_color="#00E676")
+        self.resolved_lbl.configure(text=f"-> {addr}", text_color="#00E676")
         return (addr, f"bp {addr} 2 hw", f"rbp {addr}", f"Line: {spec} @ {addr}")
 
     def get_state(self):
@@ -1377,34 +1474,41 @@ class BreakOnLineWidget(BaseBreakpointWidget):
         fmt = state.get("global_fmt", "Hex")
         self.global_fmt.set(fmt)
         self.apply_global_format(fmt)
+        self.populate_selector_rows()
 
 
 class BreakOnVarWidget(BaseBreakpointWidget):
-    # --- 3. BREAK ON VARIABLE WATCHPOINT WIDGET ---
+    # --- 3. BREAK ON VARIABLE WATCHPOINT WIDGET (SCROLL & CLICK VAR SELECTOR) ---
     def __init__(self, parent, app):
         self.var_target = ctk.StringVar(value="motor_speed")
         self.wp_mode = ctk.StringVar(value="w")
         self.wp_len = ctk.StringVar(value="4")
-        super().__init__(parent, app, border_color="#FF7043")
+        super().__init__(parent, app, border_color="#FF7043", selector_title="Select Watch Variable (.map):")
 
     def build_specific_controls(self, parent):
-        ctk.CTkLabel(parent, text="Break on Var | Var / Addr:").grid(row=0, column=0, padx=(5, 5))
-        var_list = sorted(self.app.var_symbols.keys()) if self.app.var_symbols else ["motor_speed"]
-        self.var_combo = ctk.CTkComboBox(parent, variable=self.var_target, values=var_list, width=200)
-        self.var_combo.grid(row=0, column=1, padx=5)
+        ctk.CTkLabel(parent, text="Break on Var | Selected Var / Hex:").pack(side="left", padx=(5, 5))
+        ctk.CTkEntry(parent, textvariable=self.var_target, width=180).pack(side="left", padx=5)
 
-        ctk.CTkLabel(parent, text="Access:").grid(row=0, column=2, padx=(10, 2))
-        ctk.CTkComboBox(parent, variable=self.wp_mode, values=["w", "r", "a"], width=65).grid(row=0, column=3, padx=2)
+        ctk.CTkLabel(parent, text="Access:").pack(side="left", padx=(10, 2))
+        ctk.CTkComboBox(parent, variable=self.wp_mode, values=["w", "r", "a"], width=60).pack(side="left", padx=2)
 
-        ctk.CTkLabel(parent, text="Bytes:").grid(row=0, column=4, padx=(10, 2))
-        ctk.CTkComboBox(parent, variable=self.wp_len, values=["1", "2", "4"], width=65).grid(row=0, column=5, padx=2)
+        ctk.CTkLabel(parent, text="Bytes:").pack(side="left", padx=(10, 2))
+        ctk.CTkComboBox(parent, variable=self.wp_len, values=["1", "2", "4"], width=60).pack(side="left", padx=2)
 
-        ctk.CTkButton(parent, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).grid(row=0, column=6, padx=(15, 5))
+        self.addr_preview = ctk.CTkLabel(parent, text="", font=("Consolas", 11), text_color="#FFAB91")
+        self.addr_preview.pack(side="left", padx=8)
 
-    def on_symbol_files_updated(self):
-        super().on_symbol_files_updated()
-        var_list = sorted(self.app.var_symbols.keys()) if self.app.var_symbols else ["motor_speed"]
-        self.var_combo.configure(values=var_list)
+        ctk.CTkButton(parent, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).pack(side="right", padx=5)
+
+    def get_selector_dict(self):
+        return self.app.var_symbols if self.app.var_symbols else self.app.symbol_table
+
+    def get_current_target_key(self):
+        return self.var_target.get().strip()
+
+    def on_selector_item_clicked(self, key, addr):
+        self.var_target.set(key)
+        self.addr_preview.configure(text=f"-> {addr}")
 
     def resolve_trigger_command(self):
         target = self.var_target.get().strip()
@@ -1412,6 +1516,7 @@ class BreakOnVarWidget(BaseBreakpointWidget):
         if not addr:
             self.app.log_msg(f"Break on Var Error: '{target}' is not a valid .map symbol or hex address.")
             return None
+        self.addr_preview.configure(text=f"-> {addr}")
         mode = self.wp_mode.get().strip()
         length = self.wp_len.get().strip()
         return (addr, f"wp {addr} {length} {mode}", f"rwp {addr}", f"Var WP({mode}): {target} @ {addr}")
@@ -1432,6 +1537,7 @@ class BreakOnVarWidget(BaseBreakpointWidget):
         fmt = state.get("global_fmt", "Hex")
         self.global_fmt.set(fmt)
         self.apply_global_format(fmt)
+        self.populate_selector_rows()
 
 
 class ModernOpenOCD_GUI(ctk.CTk):
@@ -1442,7 +1548,7 @@ class ModernOpenOCD_GUI(ctk.CTk):
 
         self.symbol_table = {}   # All symbols: {name: addr_hex}
         self.var_symbols = {}    # RAM / Data symbols: {name: addr_hex}
-        self.func_symbols = {}   # Code / .text symbols: {name: addr_hex}
+        self.func_symbols = {}   # Code / .text functions: {name: addr_hex}
         self.lst_table = {}      # Disassembly line map: {"file.c:line": addr_hex}
 
         self.jtag_lock = threading.Lock()
@@ -1502,7 +1608,6 @@ class ModernOpenOCD_GUI(ctk.CTk):
         ctk.CTkButton(add_frame, text="+ Alive Light", width=95, fg_color="#FBC02D", hover_color="#F9A825", text_color="black", 
                       command=lambda: AliveLightWidget(self.scrollable_frame, self)).pack(side="left", padx=(0, 16))
 
-        # --- 3 NEW BREAKPOINT WIDGET BUTTONS ---
         ctk.CTkButton(add_frame, text="+ Break on Func", width=115, fg_color="#00838F", hover_color="#006064",
                       command=lambda: BreakOnFuncWidget(self.scrollable_frame, self)).pack(side="left", padx=(0, 8))
         ctk.CTkButton(add_frame, text="+ Break on Line", width=115, fg_color="#00695C", hover_color="#004D40",
@@ -1620,48 +1725,113 @@ class ModernOpenOCD_GUI(ctk.CTk):
         self.var_symbols.clear()
         self.func_symbols.clear()
 
-        current_section = ""
-        ignored_prefixes = ("__", "_start", "_end", "_edata", "_fbss", "_sdata", "_etext", "_heap", "_stack")
+        top_section = ""
+        sub_section = ""
+        pending_sub_sym = None
+        pending_sub_kind = None  # "func" or "var"
+
+        ignored_prefixes = (
+            "__", "_start", "_end", "_edata", "_fbss", "_sdata", "_etext",
+            "_heap", "_stack", "_impure", "_global_impure", "_ctype_"
+        )
+        ignored_subsections = {"unlikely", "exit", "startup", "hot", "stub"}
+
+        def classify_section(sec_str):
+            if any(k in sec_str for k in (".text", ".init", ".ram_code", ".itim", ".fast_code", ".vector")):
+                return "func"
+            if any(k in sec_str for k in (".data", ".bss", ".sdata", ".sbss", ".uncached", "COMMON", ".noinit", ".l2")):
+                return "var"
+            return None
 
         try:
             with open(filepath, 'r', errors='ignore') as f:
-                for line in f:
+                for raw_line in f:
+                    line = raw_line.rstrip('\r\n')
                     stripped = line.strip()
                     if not stripped:
                         continue
 
-                    # Track linker section headers (.text, .data, .bss, .sdata, .sbss, .uncached_lsram, COMMON)
-                    sec_match = re.match(r'^(\.[a-zA-Z0-9_.*]+|COMMON)\b', stripped)
-                    if sec_match:
-                        current_section = sec_match.group(1)
+                    # 1. Top-level output section (starts at column 0)
+                    if not line[0].isspace():
+                        m_top = re.match(r'^(\.[a-zA-Z0-9_.*]+|COMMON)\b', stripped)
+                        if m_top:
+                            top_section = m_top.group(1)
+                            sub_section = top_section
+                            pending_sub_sym = None
+                            pending_sub_kind = None
 
-                    parts = stripped.split()
-                    if len(parts) >= 2:
-                        addr_token = None
-                        sym_token = parts[-1]
-                        if parts[0].startswith("0x"):
-                            addr_token = parts[0]
-                        elif len(parts) >= 3 and parts[1].startswith("0x"):
-                            addr_token = parts[1]
+                    # 2. Input subsection (e.g. " .text.my_func" or " .bss.my_var")
+                    m_sub = re.match(r'^\s+(\.[a-zA-Z0-9_.$*]+|COMMON)(?:\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+))?', line)
+                    if m_sub:
+                        sub_section = m_sub.group(1)
+                        kind = classify_section(sub_section) or classify_section(top_section)
 
-                        if addr_token and re.match(r'^[a-zA-Z_]\w*$', sym_token):
-                            if sym_token.startswith(ignored_prefixes):
-                                continue
-                            try:
-                                addr_int = int(addr_token, 16)
-                                if addr_int == 0:
-                                    continue
+                        # Extract symbol suffix from -ffunction-sections / -fdata-sections (e.g., .text.PID_Step -> PID_Step)
+                        sub_sym = None
+                        for prefix in (".text.", ".data.", ".bss.", ".sdata.", ".sbss.", ".uncached_lsram."):
+                            if sub_section.startswith(prefix):
+                                candidate = sub_section[len(prefix):]
+                                if candidate not in ignored_subsections and re.match(r'^[a-zA-Z_]\w*$', candidate):
+                                    sub_sym = candidate
+                                break
+
+                        if m_sub.group(2) and m_sub.group(3):
+                            # Single-line subsection with address and size
+                            addr_int = int(m_sub.group(2), 16)
+                            size_int = int(m_sub.group(3), 16)
+                            if addr_int > 0 and size_int > 0 and sub_sym and not sub_sym.startswith(ignored_prefixes):
                                 norm_addr = f"0x{addr_int:08X}"
-                            except ValueError:
-                                continue
+                                self.symbol_table[sub_sym] = norm_addr
+                                if kind == "func":
+                                    self.func_symbols[sub_sym] = norm_addr
+                                elif kind == "var":
+                                    self.var_symbols[sub_sym] = norm_addr
+                            pending_sub_sym = None
+                            pending_sub_kind = None
+                        else:
+                            # Wrapped subsection: address + size will appear on the next line
+                            pending_sub_sym = sub_sym
+                            pending_sub_kind = kind
+                        continue
 
-                            self.symbol_table[sym_token] = norm_addr
-                            if any(k in current_section for k in (".data", ".bss", ".sdata", ".sbss", ".uncached", "COMMON", ".noinit")):
-                                self.var_symbols[sym_token] = norm_addr
-                            elif ".text" in current_section:
-                                self.func_symbols[sym_token] = norm_addr
+                    # 3. Wrapped subsection continuation line: "                0x0000000080000240       0x54 ./src/motor.o"
+                    if pending_sub_sym:
+                        m_wrap = re.match(r'^\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+\S+', line)
+                        if m_wrap:
+                            addr_int = int(m_wrap.group(1), 16)
+                            size_int = int(m_wrap.group(2), 16)
+                            if addr_int > 0 and size_int > 0 and not pending_sub_sym.startswith(ignored_prefixes):
+                                norm_addr = f"0x{addr_int:08X}"
+                                self.symbol_table[pending_sub_sym] = norm_addr
+                                if pending_sub_kind == "func":
+                                    self.func_symbols[pending_sub_sym] = norm_addr
+                                elif pending_sub_kind == "var":
+                                    self.var_symbols[pending_sub_sym] = norm_addr
+                            pending_sub_sym = None
+                            pending_sub_kind = None
+                            continue
+                        pending_sub_sym = None
+                        pending_sub_kind = None
 
-            # Fallback if map file had no standard section headers
+                    # 4. Standard Global Symbol Line: "                0x0000000080000240                Motor_Control_Init"
+                    m_sym = re.match(r'^\s+(0x[0-9a-fA-F]+)\s+([a-zA-Z_]\w*)$', line)
+                    if m_sym:
+                        addr_str, sym_name = m_sym.group(1), m_sym.group(2)
+                        if sym_name.startswith(ignored_prefixes):
+                            continue
+                        addr_int = int(addr_str, 16)
+                        if addr_int == 0:
+                            continue
+                        norm_addr = f"0x{addr_int:08X}"
+                        self.symbol_table[sym_name] = norm_addr
+
+                        kind = classify_section(sub_section) or classify_section(top_section)
+                        if kind == "func":
+                            self.func_symbols[sym_name] = norm_addr
+                        elif kind == "var":
+                            self.var_symbols[sym_name] = norm_addr
+
+            # Fallback if map file had non-standard section headers
             if not self.var_symbols:
                 self.var_symbols.update(self.symbol_table)
             if not self.func_symbols:
@@ -1672,7 +1842,7 @@ class ModernOpenOCD_GUI(ctk.CTk):
                 text=f"{fname} ({len(self.var_symbols)} vars, {len(self.func_symbols)} funcs)",
                 text_color="#4CAF50"
             )
-            self.log_msg(f"Loaded .map: {len(self.var_symbols)} RAM variables, {len(self.func_symbols)} functions.")
+            self.log_msg(f"Loaded .map: {len(self.var_symbols)} RAM variables and {len(self.func_symbols)} functions ready to scroll & select.")
             self.notify_symbol_files_updated()
         except Exception as e:
             self.log_msg(f"ERROR reading map file: {e}")
@@ -1687,7 +1857,6 @@ class ModernOpenOCD_GUI(ctk.CTk):
             with open(filepath, 'r', errors='ignore') as f:
                 for line in f:
                     stripped = line.strip()
-                    # Match source file:line markers (e.g. /path/main.c:142 or C:\path\main.c:142)
                     m_src = re.match(r'^(.+?\.[cChHsS](?:pp)?):(\d+)', stripped)
                     if m_src:
                         base_file = os.path.basename(m_src.group(1))
@@ -1695,7 +1864,6 @@ class ModernOpenOCD_GUI(ctk.CTk):
                         pending_line_key = f"{base_file}:{line_num}"
                         continue
 
-                    # Match first following instruction address (e.g. "  800014a8:  00c7a783   lw a5,12(a5)")
                     if pending_line_key:
                         m_inst = re.match(r'^\s*([0-9a-fA-F]{4,16}):\s+[0-9a-fA-F]{4,8}\s+', line)
                         if m_inst:
