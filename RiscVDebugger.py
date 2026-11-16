@@ -21,6 +21,7 @@ from widgets_telemetry import (
     MemBlockPlotter,
     MemFileLoader,
     AliveLightWidget,
+    EnumSelectorWidget,
 )
 from widgets_breakpoints import (
     BreakOnFuncWidget,
@@ -102,6 +103,10 @@ class ModernOpenOCD_GUI(ctk.CTk):
         ctk.CTkButton(
             add_frame, text="+ Write Slider", width=100, fg_color="#2E7D32", hover_color="#1B5E20",
             command=lambda: VarSlider(self.scrollable_frame, self),
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            add_frame, text="+ Enum Switch", width=110, fg_color="#3F51B5", hover_color="#303F9F",
+            command=lambda: EnumSelectorWidget(self.scrollable_frame, self),
         ).pack(side="left", padx=(0, 8))
         ctk.CTkButton(
             add_frame, text="+ Mem Plotter", width=100, fg_color="#8E24AA", hover_color="#6A1B9A",
@@ -268,6 +273,7 @@ class ModernOpenOCD_GUI(ctk.CTk):
             return
         widget_Factory = {
             "write": VarSlider,
+            "enum_selector": EnumSelectorWidget,
             "read": ReadMonitor,
             "plotter": MemBlockPlotter,
             "loader": MemFileLoader,
