@@ -28,6 +28,10 @@ class OpenOCDSession:
 
     def send(self, command: str) -> str:
         """Sends a TCL command terminated with 0x1A and returns the response string."""
+        # Prevent double-bracket evaluation ('invalid command name "running"') in JimTCL
+        if command.strip() == "[[target current] curstate]":
+            command = "[target current] curstate"
+
         self.sock.sendall(command.encode("utf-8") + b"\x1a")
         resp = b""
         while b"\x1a" not in resp:
@@ -44,13 +48,15 @@ def start_openocd_console(exe_path: str, cfg_path: str):
     cfg_file = os.path.basename(cfg_path)
 
     if os.name == "nt":
+        # Merge stderr into stdout via cmd.exe first so PowerShell never wraps lines in RemoteException
         ps_script = (
-            f"$host.UI.RawUI.WindowTitle = 'OpenOCD Live Console'; "
-            f"& '{exe_path}' -s '{cfg_dir}' -f '{cfg_file}' 2>&1 | ForEach-Object {{ "
-            f"if ($_ -match 'Error') {{ Write-Host $_ -ForegroundColor Red }} "
-            f"elseif ($_ -match 'Warn') {{ Write-Host $_ -ForegroundColor Yellow }} "
-            f"elseif ($_ -match 'Info') {{ Write-Host $_ -ForegroundColor Cyan }} "
-            f"else {{ Write-Host $_ -ForegroundColor Gray }} }}"
+            "$host.UI.RawUI.WindowTitle = 'OpenOCD Live Console'; "
+            f"cmd /c '\"\"{exe_path}\" -s \"{cfg_dir}\" -f \"{cfg_file}\" 2>&1\"' | ForEach-Object {{ "
+            "$line = $_.ToString(); "
+            "if ($line -match 'Error') { Write-Host $line -ForegroundColor Red } "
+            "elseif ($line -match 'Warn') { Write-Host $line -ForegroundColor Yellow } "
+            "elseif ($line -match 'Info') { Write-Host $line -ForegroundColor Cyan } "
+            "else { Write-Host $line -ForegroundColor Gray } }"
         )
         cmd = ["powershell", "-NoLogo", "-NoExit", "-Command", ps_script]
         return subprocess.Popen(cmd, cwd=cfg_dir, creationflags=subprocess.CREATE_NEW_CONSOLE)
