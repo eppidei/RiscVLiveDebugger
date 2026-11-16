@@ -131,9 +131,21 @@ class ModernOpenOCD_GUI(ctk.CTk):
 
         self.scrollable_frame = ctk.CTkScrollableFrame(self, corner_radius=10)
         self.scrollable_frame.pack(side="top", fill="both", expand=True, padx=20, pady=5)
-
+        
         self.log_text = ctk.CTkTextbox(self, height=100, state="disabled", font=("Consolas", 12))
-        self.log_text.pack(pady=15, padx=20, fill="x")
+        self.log_text.pack(pady=(15, 5), padx=20, fill="x")
+
+        footer_frame = ctk.CTkFrame(self, fg_color="transparent")
+        footer_frame.pack(fill="x", padx=20, pady=(0, 10))
+        
+        author_lbl = ctk.CTkLabel(
+            footer_frame, 
+            text="RISCV Live Tuner & Telemetry Dashboard  |  Developed by Leonardo Di Carlo", 
+            font=("Consolas", 11), 
+            text_color="#777777",
+            anchor="w"
+        )
+        author_lbl.pack(side="left")
 
     def disable_all_auto_poll(self):
         for widget in self.scrollable_frame.winfo_children():
