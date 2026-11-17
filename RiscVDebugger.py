@@ -136,9 +136,16 @@ class ModernOpenOCD_GUI(ctk.CTk):
 
         self.scrollable_frame = ctk.CTkScrollableFrame(self, corner_radius=10)
         self.scrollable_frame.pack(side="top", fill="both", expand=True, padx=20, pady=5)
+
+        # Create a 2000px-tall 2D canvas surface inside the scrollable frame for free-form placement
+        self.workspace = ctk.CTkFrame(self.scrollable_frame, height=2000, fg_color="transparent")
+        self.workspace.pack(fill="x", expand=True)
         
         self.log_text = ctk.CTkTextbox(self, height=100, state="disabled", font=("Consolas", 12))
         self.log_text.pack(pady=(15, 5), padx=20, fill="x")
+
+
+
 
         footer_frame = ctk.CTkFrame(self, fg_color="transparent")
         footer_frame.pack(fill="x", padx=20, pady=(0, 10))
@@ -257,9 +264,12 @@ class ModernOpenOCD_GUI(ctk.CTk):
         filepath = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Layouts", "*.json")])
         if not filepath:
             return
-        layout_data = [
-            w.get_state() for w in self.scrollable_frame.winfo_children() if hasattr(w, "get_state")
-        ]
+        layout_data = []
+        for w in self.workspace.winfo_children():
+            if hasattr(w, "get_state"):
+                st = w.get_state()
+                st.update(w.get_geometry_state())  # Saves x, y, w, h!
+                layout_data.append(st)
         try:
             with open(filepath, "w") as f:
                 json.dump(layout_data, f, indent=4)
@@ -268,6 +278,9 @@ class ModernOpenOCD_GUI(ctk.CTk):
             self.log_msg(f"ERROR saving layout: {e}")
 
     def load_layout(self):
+        new_w = cls(self.workspace, self)
+        new_w.set_state(state)
+        new_w.set_geometry_state(state)
         filepath = filedialog.askopenfilename(filetypes=[("JSON Layouts", "*.json"), ("All Files", "*.*")])
         if not filepath:
             return

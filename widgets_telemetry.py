@@ -12,7 +12,184 @@ from matplotlib.figure import Figure
 from ocd_backend import OpenOCDSession
 
 
+import tkinter as tk
+
+
 class BaseWidget(ctk.CTkFrame):
+    GRID_SNAP = 20  # Snap position and size to 20px grid
+
+    # Default (width, height) tailored to each widget class
+    DEFAULT_SIZES = {
+        "AliveLightWidget": (520, 120),
+        "VarSlider": (560, 145),
+        "EnumSelectorWidget": (560, 175),
+        "MemFileLoader": (540, 155),
+        "ReadMonitor": (580, 130),
+        "MemBlockPlotter": (600, 390),
+        "BreakOnFuncWidget": (880, 310),
+        "BreakOnLineWidget": (880, 310),
+        "BreakOnVarWidget": (880, 310),
+    }
+
+    def __init__(self, parent, **kwargs):
+        cls_name = self.__class__.__name__
+        def_w, def_h = self.DEFAULT_SIZES.get(cls_name, (560, 150))
+        kwargs.setdefault("width", def_w)
+        kwargs.setdefault("height", def_h)
+        super().__init__(parent, **kwargs)
+
+        # Use _tile_* prefix so we never overwrite Tkinter's reserved self._w path string
+        self._tile_w = kwargs["width"]
+        self._tile_h = kwargs["height"]
+        self._tile_x = 20
+        self._tile_y = 20
+
+        self._drag_start_x = 0
+        self._drag_start_y = 0
+        self._resize_start_x = 0
+        self._resize_start_y = 0
+        self._resize_start_w = self._tile_w
+        self._resize_start_h = self._tile_h
+
+    def pack(self, *args, **kwargs):
+        """
+        Intercepts the subclass self.pack(...) call and places the widget
+        as a draggable, resizable 2D tile on the parent surface.
+        """
+        self.pack_propagate(False)
+        self.grid_propagate(False)
+
+        siblings = [
+            w for w in self.master.winfo_children()
+            if isinstance(w, BaseWidget) and w is not self
+        ]
+        if not siblings:
+            self._tile_x, self._tile_y = 20, 20
+        else:
+            last = siblings[-1]
+            if last._tile_x + last._tile_w + self._tile_w + 40 <= 1140:
+                self._tile_x = last._tile_x + last._tile_w + 20
+                self._tile_y = last._tile_y
+            else:
+                max_bottom = max(w._tile_y + w._tile_h for w in siblings)
+                self._tile_x = 20
+                self._tile_y = max_bottom + 20
+
+        self.place(x=self._tile_x, y=self._tile_y)
+        self._install_drag_and_resize_handles()
+        self._update_canvas_height()
+
+    def _install_drag_and_resize_handles(self):
+        # 1. Top-left Drag Handle ("⠿")
+        self.drag_handle = ctk.CTkLabel(
+            self,
+            text="⠿",
+            font=("Consolas", 16, "bold"),
+            text_color="#888888",
+            width=18,
+            height=18,
+            cursor="fleur",
+        )
+        self.drag_handle.place(x=3, y=3)
+
+        for target in (self.drag_handle, self):
+            target.bind("<ButtonPress-1>", self._on_drag_start)
+            target.bind("<B1-Motion>", self._on_drag_motion)
+
+        # 2. Bottom-right Resize Grip ("◢")
+        self.resize_grip = ctk.CTkLabel(
+            self,
+            text="◢",
+            font=("Consolas", 13),
+            text_color="#888888",
+            width=16,
+            height=16,
+            cursor="size_nw_se",
+        )
+        self.resize_grip.place(relx=1.0, rely=1.0, x=-3, y=-3, anchor="se")
+        self.resize_grip.bind("<ButtonPress-1>", self._on_resize_start)
+        self.resize_grip.bind("<B1-Motion>", self._on_resize_motion)
+
+        # Raise handles above inner frames after subclass __init__ finishes
+        self.after(20, self._lift_handles)
+
+    def _lift_handles(self):
+        if self.winfo_exists():
+            self.drag_handle.lift()
+            self.resize_grip.lift()
+
+    def _on_drag_start(self, event):
+        self.lift()
+        self._lift_handles()
+        self._drag_start_x = event.x_root - self._tile_x
+        self._drag_start_y = event.y_root - self._tile_y
+
+    def _on_drag_motion(self, event):
+        raw_x = event.x_root - self._drag_start_x
+        raw_y = event.y_root - self._drag_start_y
+        self._tile_x = max(10, round(raw_x / self.GRID_SNAP) * self.GRID_SNAP)
+        self._tile_y = max(10, round(raw_y / self.GRID_SNAP) * self.GRID_SNAP)
+        self.place(x=self._tile_x, y=self._tile_y)
+        self._update_canvas_height()
+
+    def _on_resize_start(self, event):
+        self.lift()
+        self._lift_handles()
+        self._resize_start_x = event.x_root
+        self._resize_start_y = event.y_root
+        self._resize_start_w = self._tile_w
+        self._resize_start_h = self._tile_h
+
+    def _on_resize_motion(self, event):
+        dx = event.x_root - self._resize_start_x
+        dy = event.y_root - self._resize_start_y
+        new_w = max(320, round((self._resize_start_w + dx) / self.GRID_SNAP) * self.GRID_SNAP)
+        new_h = max(100, round((self._resize_start_h + dy) / self.GRID_SNAP) * self.GRID_SNAP)
+        if new_w != self._tile_w or new_h != self._tile_h:
+            self._tile_w = new_w
+            self._tile_h = new_h
+            self.configure(width=self._tile_w, height=self._tile_h)
+            self._lift_handles()
+            self._update_canvas_height()
+
+    def set_tile_size(self, w=None, h=None):
+        if w is not None:
+            self._tile_w = w
+        if h is not None:
+            self._tile_h = h
+        self.configure(width=self._tile_w, height=self._tile_h)
+        self._lift_handles()
+        self._update_canvas_height()
+
+    def _update_canvas_height(self):
+        """Keeps an invisible spacer inside CTkScrollableFrame so the scrollbar tracks .place() tiles."""
+        siblings = [w for w in self.master.winfo_children() if isinstance(w, BaseWidget)]
+        max_bottom = max((w._tile_y + w._tile_h for w in siblings), default=600)
+        try:
+            spacer = getattr(self.master, "_tile_spacer", None)
+            if spacer is None or not spacer.winfo_exists():
+                spacer = tk.Frame(self.master, width=1, height=700, highlightthickness=0, bd=0)
+                spacer.pack(side="top", anchor="nw")
+                self.master._tile_spacer = spacer
+            spacer.configure(height=max(700, max_bottom + 80))
+        except Exception:
+            pass
+
+    def get_geometry_state(self):
+        return {"x": self._tile_x, "y": self._tile_y, "w": self._tile_w, "h": self._tile_h}
+
+    def set_geometry_state(self, state):
+        if "x" in state and "y" in state:
+            self._tile_x = state["x"]
+            self._tile_y = state["y"]
+            self.place(x=self._tile_x, y=self._tile_y)
+        if "w" in state and "h" in state:
+            self._tile_w = state["w"]
+            self._tile_h = state["h"]
+            self.configure(width=self._tile_w, height=self._tile_h)
+        self._lift_handles()
+        self._update_canvas_height()
+
     def get_resolved_addr(self, addr_str):
         addr_str = addr_str.strip()
         if addr_str in self.app.symbol_table:
@@ -26,8 +203,7 @@ class BaseWidget(ctk.CTkFrame):
             return addr_str if addr_str.startswith("0x") else "0x" + addr_str
         except ValueError:
             return None
-
-
+        
 class VarSlider(BaseWidget):
     # --- WRITE SLIDER WIDGET ---
     def __init__(self, parent, app):
