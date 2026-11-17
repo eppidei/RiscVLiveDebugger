@@ -1,5 +1,6 @@
 # widgets_telemetry.py
 import re
+import struct
 import threading
 from collections import deque
 import customtkinter as ctk
@@ -140,6 +141,165 @@ class VarSlider(BaseWidget):
         self.min_val.set(state.get("min_val", "0"))
         self.max_val.set(state.get("max_val", "255"))
         self.update_config()
+
+
+class EnumSelectorWidget(BaseWidget):
+    # --- DISCRETE VALUE / CHOICE SWITCHER WIDGET ---
+    def __init__(self, parent, app):
+        super().__init__(parent, corner_radius=10, border_width=2, border_color="#3F51B5")
+        self.app = app
+        self.pack(fill="x", pady=10, padx=10)
+
+        self.var_name = ctk.StringVar(value="operating_mode")
+        self.var_type = ctk.StringVar(value="uint32")
+
+        self.choices_str = ctk.StringVar(value="OFF:0, ON:1")
+        self.current_selection = ctk.StringVar(value="OFF")
+
+        config_frame = ctk.CTkFrame(self, fg_color="transparent")
+        config_frame.pack(fill="x", padx=10, pady=(10, 5))
+
+        ctk.CTkLabel(config_frame, text="Choice | Addr/Name:").grid(row=0, column=0, padx=5)
+        ctk.CTkEntry(config_frame, textvariable=self.var_name, width=140).grid(row=0, column=1, padx=5)
+
+        ctk.CTkLabel(config_frame, text="Type:").grid(row=0, column=2, padx=5)
+        ctk.CTkComboBox(
+            config_frame,
+            variable=self.var_type,
+            values=["uint8", "uint16", "uint32", "int8", "int16", "int32", "float"],
+            width=85,
+        ).grid(row=0, column=3, padx=5)
+
+        ctk.CTkButton(config_frame, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).grid(row=0, column=4, padx=10)
+
+        choices_frame = ctk.CTkFrame(self, fg_color="transparent")
+        choices_frame.pack(fill="x", padx=10, pady=(0, 5))
+
+        ctk.CTkLabel(choices_frame, text="Values [Label:Val, ...]:").pack(side="left", padx=5)
+        self.choices_entry = ctk.CTkEntry(choices_frame, textvariable=self.choices_str, width=320)
+        self.choices_entry.pack(side="left", padx=5, fill="x", expand=True)
+        ctk.CTkButton(choices_frame, text="Set Choices", width=95, command=self.rebuild_buttons).pack(side="left", padx=5)
+
+        self.btn_container = ctk.CTkFrame(self, fg_color="#1E1E1E", corner_radius=6)
+        self.btn_container.pack(fill="x", padx=15, pady=(5, 12))
+
+        self.parsed_choices = {}
+        self.segmented_btn = None
+        self.rebuild_buttons()
+
+    def rebuild_buttons(self):
+        raw = self.choices_str.get()
+        self.parsed_choices.clear()
+
+        for pair in raw.split(","):
+            if ":" in pair:
+                label, val_str = pair.split(":", 1)
+                label = label.strip()
+                val_str = val_str.strip()
+                try:
+                    if "." in val_str or (val_str.lower().endswith("f") and not val_str.lower().startswith("0x")):
+                        val = float(val_str.lower().rstrip("f"))
+                    elif val_str.lower().startswith("0x"):
+                        val = int(val_str, 16)
+                    else:
+                        val = int(val_str)
+                    self.parsed_choices[label] = val
+                except ValueError:
+                    pass
+
+        if not self.parsed_choices:
+            self.parsed_choices = {"OFF": 0, "ON": 1}
+
+        if self.segmented_btn:
+            self.segmented_btn.destroy()
+
+        labels = list(self.parsed_choices.keys())
+        if self.current_selection.get() not in labels:
+            self.current_selection.set(labels[0])
+
+        self.segmented_btn = ctk.CTkSegmentedButton(
+            self.btn_container,
+            values=labels,
+            variable=self.current_selection,
+            command=self.on_choice_selected,
+        )
+        self.segmented_btn.pack(fill="x", padx=10, pady=8)
+
+    def on_choice_selected(self, label):
+        if not self.winfo_exists():
+            return
+        val = self.parsed_choices.get(label)
+        if val is not None:
+            self.execute_write(val)
+
+    def execute_write(self, value):
+        if not self.winfo_exists():
+            return
+        name = self.var_name.get()
+        addr = self.get_resolved_addr(name)
+        if not addr:
+            self.app.log_msg(f"Wait: '{name}' is not a valid map symbol or hex address!")
+            return
+
+        v_type = self.var_type.get()
+        if v_type == "float":
+            try:
+                packed = struct.pack("<f", float(value))
+                int_val = struct.unpack("<I", packed)[0]
+                hex_val = f"0x{int_val:08X}"
+                mem_cmd = "mww"
+            except Exception as e:
+                self.app.log_msg(f"Float Write ERROR: {e}")
+                return
+        else:
+            int_val = int(value)
+            if int_val < 0:
+                bits = 8 if "8" in v_type else (16 if "16" in v_type else 32)
+                int_val = (1 << bits) + int_val
+
+            cmd_map = {"8": "mwb", "16": "mwh", "32": "mww"}
+            mem_cmd = cmd_map.get(v_type.replace("uint", "").replace("int", ""), "mww")
+            hex_val = hex(int_val)
+
+        def _write_task():
+            with self.app.jtag_lock:
+                try:
+                    with OpenOCDSession(timeout=2.0) as ocd:
+                        state = ocd.send("[target current] curstate")
+                        was_running = "running" in state
+                        if was_running:
+                            ocd.send("halt; wait_halt")
+                        ocd.send(f"{mem_cmd} {addr} {hex_val}")
+                        if was_running and not self.app.target_halted_at_bp:
+                            ocd.send("resume")
+                        self.after(
+                            0,
+                            lambda: self.app.log_msg(
+                                f"Choice Write: set '{name}' to {self.current_selection.get()} ({hex_val})"
+                            ),
+                        )
+                except Exception as e:
+                    self.after(0, lambda: self.app.log_msg(f"Choice Write ERROR: {str(e)}"))
+
+        threading.Thread(target=_write_task, daemon=True).start()
+
+    def get_state(self):
+        return {
+            "widget_type": "enum_selector",
+            "var_name": self.var_name.get(),
+            "var_type": self.var_type.get(),
+            "choices_str": self.choices_str.get(),
+            "current_selection": self.current_selection.get(),
+        }
+
+    def set_state(self, state):
+        self.var_name.set(state.get("var_name", "operating_mode"))
+        self.var_type.set(state.get("var_type", "uint32"))
+        self.choices_str.set(state.get("choices_str", "OFF:0, ON:1"))
+        self.rebuild_buttons()
+        sel = state.get("current_selection")
+        if sel in self.parsed_choices:
+            self.current_selection.set(sel)
 
 
 class ReadMonitor(BaseWidget):

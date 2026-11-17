@@ -17,11 +17,11 @@ from ocd_backend import (
 )
 from widgets_telemetry import (
     VarSlider,
+    EnumSelectorWidget,
     ReadMonitor,
     MemBlockPlotter,
     MemFileLoader,
     AliveLightWidget,
-    EnumSelectorWidget,
 )
 from widgets_breakpoints import (
     BreakOnFuncWidget,
@@ -36,7 +36,7 @@ ctk.set_default_color_theme("blue")
 class ModernOpenOCD_GUI(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("PolarFire Live Tuner & Telemetry Dashboard")
+        self.title("RiscV Live Tuner & Telemetry Dashboard")
         self.geometry("1150x860")
 
         self.symbol_table = {}
@@ -271,7 +271,7 @@ class ModernOpenOCD_GUI(ctk.CTk):
         filepath = filedialog.askopenfilename(filetypes=[("JSON Layouts", "*.json"), ("All Files", "*.*")])
         if not filepath:
             return
-        widget_Factory = {
+        widget_factory = {
             "write": VarSlider,
             "enum_selector": EnumSelectorWidget,
             "read": ReadMonitor,
@@ -288,7 +288,7 @@ class ModernOpenOCD_GUI(ctk.CTk):
             for widget in self.scrollable_frame.winfo_children():
                 widget.destroy()
             for state in layout_data:
-                cls = widget_Factory.get(state.get("widget_type"))
+                cls = widget_factory.get(state.get("widget_type"))
                 if cls:
                     new_w = cls(self.scrollable_frame, self)
                     new_w.set_state(state)
