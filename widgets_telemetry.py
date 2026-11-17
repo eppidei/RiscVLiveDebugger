@@ -955,8 +955,94 @@ class AliveLightWidget(BaseWidget):
         ctk.CTkSwitch(display_frame, text="Auto Poll", variable=self.auto_poll, command=self.toggle_poll).pack(side="right", padx=(10, 5))
         ctk.CTkLabel(display_frame, text="ms").pack(side="right", padx=(0, 5))
         ctk.CTkEntry(display_frame, textvariable=self.poll_interval, width=50).pack(side="right")
-        
-# Add this class to widgets_telemetry.py
+
+    def toggle_poll(self):
+        if self.auto_poll.get():
+            self.execute_read()
+        else:
+            self.light.configure(fg_color="#424242")
+            self.status_lbl.configure(text="Stopped", text_color="gray")
+
+    def execute_read(self, halted_only=False):
+        if not self.winfo_exists():
+            return
+
+        name = self.var_name.get()
+        addr = self.get_resolved_addr(name)
+        if not addr:
+            self.set_error("Invalid Address")
+            self.auto_poll.set(False)
+            return
+
+        try:
+            interval = max(50, int(self.poll_interval.get()))
+        except ValueError:
+            interval = 500
+            self.poll_interval.set("500")
+
+        v_type = self.var_type.get()
+        cmd = "mdb" if "8" in v_type else ("mdh" if "16" in v_type else "mdw")
+
+        def _read_task():
+            with self.app.jtag_lock:
+                try:
+                    with OpenOCDSession(timeout=2.0) as ocd:
+                        if halted_only or self.app.target_halted_at_bp:
+                            output = ocd.send(f"{cmd} {addr}")
+                        else:
+                            state = ocd.send("[target current] curstate")
+                            if "halted" in state:
+                                self.after(0, self.app.disable_all_auto_poll)
+                                output = ocd.send(f"{cmd} {addr}")
+                            else:
+                                ocd.send("halt; wait_halt")
+                                output = ocd.send(f"{cmd} {addr}")
+                                ocd.send("resume")
+
+                        self.after(0, lambda: self.process_read(output))
+                except Exception:
+                    self.after(0, lambda: self.set_error("Comm Error"))
+
+        threading.Thread(target=_read_task, daemon=True).start()
+
+        if self.auto_poll.get() and not halted_only:
+            self.after(interval, self.execute_read)
+
+    def process_read(self, output):
+        if not self.winfo_exists():
+            return
+        match = re.search(r":\s*([0-9a-fA-F]+)", output)
+        if match:
+            val = int(match.group(1), 16)
+            if val > 0:
+                self.light.configure(fg_color="#00E676")
+                self.status_lbl.configure(text=f"TRUE ({val})", text_color="#00E676")
+            else:
+                self.light.configure(fg_color="#424242")
+                self.status_lbl.configure(text="FALSE (0)", text_color="gray")
+        else:
+            self.set_error("Parse Error")
+
+    def set_error(self, msg):
+        if self.winfo_exists():
+            self.light.configure(fg_color="#D50000")
+            self.status_lbl.configure(text=msg, text_color="#D50000")
+
+    def get_state(self):
+        return {
+            "widget_type": "alive_light",
+            "var_name": self.var_name.get(),
+            "var_type": self.var_type.get(),
+            "poll_interval": self.poll_interval.get(),
+        }
+
+    def set_state(self, state):
+        self.var_name.set(state.get("var_name", "system_alive"))
+        self.var_type.set(state.get("var_type", "uint8"))
+        self.poll_interval.set(state.get("poll_interval", "500"))
+        if state.get("auto_poll", False):
+            self.auto_poll.set(True)
+            self.toggle_poll()
 
 class EnumSelectorWidget(BaseWidget):
     # --- DISCRETE ENUM / CHOICE SWITCHER WIDGET ---
