@@ -31,6 +31,7 @@ Developing real-time embedded firmware on FPGA soft-cores (such as the Microchip
 
 ### The Solution
 
+> **Attach-Only Workflow Note:** This dashboard is designed to **attach to an already-programmed/running target** via OpenOCD for live telemetry, parameter tuning, memory block inspection, and breakpoint snapshots—it is **not** a firmware flasher or a full source-level step debugger. Program/flash your firmware image using your normal build/programming flow (e.g., SoftConsole / FlashPro / OpenOCD flash script) first, then load the matching `.map` file (and optional `.lst` file) here to attach and inspect live state.
 This tool bypasses GDB entirely. It communicates with OpenOCD via a lightweight TCP/IP socket connection directly to its TCL command interface (port 6666). For live telemetry and tuning, the core is halted, inspected or modified, and resumed within microsecond windows. For deterministic fault-catching, native RISC-V hardware triggers (`bp` and `wp`) halt the target at full clock speed and capture a cycle-coherent snapshot of all firmware variables in a single pass.
 
 ---
