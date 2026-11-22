@@ -2,6 +2,7 @@
 import re
 import struct
 import threading
+import tkinter as tk
 from collections import deque
 import customtkinter as ctk
 from tkinter import filedialog
@@ -12,37 +13,35 @@ from matplotlib.figure import Figure
 from ocd_backend import OpenOCDSession
 
 
-import tkinter as tk
-
-
 class BaseWidget(ctk.CTkFrame):
     GRID_SNAP = 20  # Snap position and size to 20px grid
 
-    # Default (width, height) tailored to each widget class
     DEFAULT_SIZES = {
-        "AliveLightWidget": (520, 120),
-        "VarSlider": (560, 145),
-        "EnumSelectorWidget": (560, 175),
-        "MemFileLoader": (540, 155),
-        "ReadMonitor": (580, 130),
-        "MemBlockPlotter": (600, 390),
-        "BreakOnFuncWidget": (880, 310),
-        "BreakOnLineWidget": (880, 310),
-        "BreakOnVarWidget": (880, 310),
+        "AliveLightWidget": (560, 135),
+        "VarSlider": (620, 155),
+        "EnumSelectorWidget": (600, 185),
+        "MemFileLoader": (580, 165),
+        "ReadMonitor": (640, 145),
+        "MemBlockPlotter": (640, 400),
+        "BreakOnFuncWidget": (900, 320),
+        "BreakOnLineWidget": (900, 320),
+        "BreakOnVarWidget": (900, 320),
     }
 
     def __init__(self, parent, **kwargs):
         cls_name = self.__class__.__name__
-        def_w, def_h = self.DEFAULT_SIZES.get(cls_name, (560, 150))
+        def_w, def_h = self.DEFAULT_SIZES.get(cls_name, (580, 150))
         kwargs.setdefault("width", def_w)
         kwargs.setdefault("height", def_h)
         super().__init__(parent, **kwargs)
 
-        # Use _tile_* prefix so we never overwrite Tkinter's reserved self._w path string
         self._tile_w = kwargs["width"]
         self._tile_h = kwargs["height"]
         self._tile_x = 20
         self._tile_y = 20
+        self._tile_placed = False
+        self._updating_scrollbars = False
+        self._adopted_children = set()
 
         self._drag_start_x = 0
         self._drag_start_y = 0
@@ -51,36 +50,196 @@ class BaseWidget(ctk.CTkFrame):
         self._resize_start_w = self._tile_w
         self._resize_start_h = self._tile_h
 
+        self._build_scroll_viewport()
+
+    def _build_scroll_viewport(self):
+        """Creates a viewport with auto-appearing horizontal & vertical sliding bars."""
+        bg_col = self._apply_appearance_mode(self.cget("fg_color"))
+        if not bg_col or bg_col == "transparent":
+            bg_col = "#2b2b2b"
+
+        self._vp_container = tk.Frame(self, bg=bg_col, highlightthickness=0, bd=0)
+        self._vp_container.place(x=4, y=22, relwidth=1.0, relheight=1.0, width=-8, height=-26)
+
+        self._vp_canvas = tk.Canvas(
+            self._vp_container,
+            bg=bg_col,
+            highlightthickness=0,
+            bd=0,
+        )
+        self._h_scroll = ctk.CTkScrollbar(
+            self._vp_container,
+            orientation="horizontal",
+            height=12,
+            command=self._vp_canvas.xview,
+        )
+        self._v_scroll = ctk.CTkScrollbar(
+            self._vp_container,
+            orientation="vertical",
+            width=12,
+            command=self._vp_canvas.yview,
+        )
+        self._vp_canvas.configure(
+            xscrollcommand=self._h_scroll.set,
+            yscrollcommand=self._v_scroll.set,
+        )
+
+        # Pack scrollbars first so _vp_canvas claims exact remaining space when shown
+        self._v_scroll.pack(side="right", fill="y")
+        self._h_scroll.pack(side="bottom", fill="x")
+        self._vp_canvas.pack(side="left", fill="both", expand=True)
+
+        self._v_scroll.pack_forget()
+        self._h_scroll.pack_forget()
+
+        self._inner_frame = tk.Frame(self._vp_canvas, bg=bg_col, highlightthickness=0, bd=0)
+        self._vp_win_id = self._vp_canvas.create_window((0, 0), window=self._inner_frame, anchor="nw")
+
+        self._inner_frame.bind("<Configure>", self._on_inner_configure)
+        self._vp_canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # Vertical mouse-wheel scrolling inside the widget viewport
+        for target in (self._vp_canvas, self._inner_frame):
+            target.bind("<MouseWheel>", self._on_tile_mousewheel)
+
+        # Right-click context menu fallback to delete a widget even if 'X' is scrolled off-screen
+        self._ctx_menu = tk.Menu(self, tearoff=0)
+        self._ctx_menu.add_command(label="Delete Widget", command=self.destroy)
+        for target in (self, self._vp_canvas, self._inner_frame):
+            target.bind("<Button-3>", self._show_context_menu)
+
+    def _show_context_menu(self, event):
+        try:
+            self._ctx_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._ctx_menu.grab_release()
+
+    def _on_tile_mousewheel(self, event):
+        if self._v_scroll.winfo_manager() and self.winfo_exists():
+            self._vp_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+
+    def _adopt_children_into_viewport(self):
+        """Moves subclass UI elements into _inner_frame so overflow gets sliding bars."""
+        if not self.winfo_exists():
+            return
+
+        reserved = {self._vp_container}
+        if hasattr(self, "drag_handle"):
+            reserved.add(self.drag_handle)
+        if hasattr(self, "resize_grip"):
+            reserved.add(self.resize_grip)
+
+        moved_any = False
+        for child in list(self.winfo_children()):
+            if child in reserved or child in self._adopted_children:
+                continue
+            self._adopted_children.add(child)
+            mgr = child.winfo_manager()
+            if mgr == "pack":
+                child.pack_configure(in_=self._inner_frame)
+                moved_any = True
+            elif mgr == "grid":
+                child.grid_configure(in_=self._inner_frame)
+                moved_any = True
+
+        if moved_any:
+            self.after(20, self._on_inner_configure)
+            self.after(30, self._lift_handles)
+
+    def _on_inner_configure(self, event=None):
+        if not self.winfo_exists():
+            return
+        self.update_idletasks()
+        req_w = self._inner_frame.winfo_reqwidth()
+        req_h = self._inner_frame.winfo_reqheight()
+        vis_w = max(1, self._vp_canvas.winfo_width())
+        vis_h = max(1, self._vp_canvas.winfo_height())
+
+        target_w = max(req_w, vis_w)
+        target_h = max(req_h, vis_h)
+        self._vp_canvas.itemconfigure(self._vp_win_id, width=target_w, height=target_h)
+        self._vp_canvas.configure(scrollregion=(0, 0, target_w, target_h))
+        self._sync_scrollbars()
+
+    def _on_canvas_configure(self, event=None):
+        if not self.winfo_exists():
+            return
+        self._adopt_children_into_viewport()
+        req_w = self._inner_frame.winfo_reqwidth()
+        req_h = self._inner_frame.winfo_reqheight()
+        vis_w = max(1, self._vp_canvas.winfo_width())
+        vis_h = max(1, self._vp_canvas.winfo_height())
+
+        target_w = max(req_w, vis_w)
+        target_h = max(req_h, vis_h)
+        self._vp_canvas.itemconfigure(self._vp_win_id, width=target_w, height=target_h)
+        self._vp_canvas.configure(scrollregion=(0, 0, target_w, target_h))
+        self._sync_scrollbars()
+
+    def _sync_scrollbars(self):
+        if self._updating_scrollbars or not self.winfo_exists():
+            return
+        self._updating_scrollbars = True
+        try:
+            req_w = self._inner_frame.winfo_reqwidth()
+            req_h = self._inner_frame.winfo_reqheight()
+            vis_w = self._vp_canvas.winfo_width()
+            vis_h = self._vp_canvas.winfo_height()
+
+            if vis_w <= 1 or vis_h <= 1:
+                return
+
+            need_h = req_w > (vis_w + 2)
+            need_v = req_h > (vis_h + 2)
+
+            if need_h and not self._h_scroll.winfo_manager():
+                self._h_scroll.pack(side="bottom", fill="x", before=self._vp_canvas)
+            elif not need_h and self._h_scroll.winfo_manager():
+                self._h_scroll.pack_forget()
+                self._vp_canvas.xview_moveto(0.0)
+
+            if need_v and not self._v_scroll.winfo_manager():
+                self._v_scroll.pack(side="right", fill="y", before=self._vp_canvas)
+            elif not need_v and self._v_scroll.winfo_manager():
+                self._v_scroll.pack_forget()
+                self._vp_canvas.yview_moveto(0.0)
+        finally:
+            self._updating_scrollbars = False
+
     def pack(self, *args, **kwargs):
-        """
-        Intercepts the subclass self.pack(...) call and places the widget
-        as a draggable, resizable 2D tile on the parent surface.
-        """
-        self.pack_propagate(False)
-        self.grid_propagate(False)
+        """Places this BaseWidget tile on the parent workspace and schedules child adoption."""
+        if not self._tile_placed:
+            self._tile_placed = True
+            self.pack_propagate(False)
+            self.grid_propagate(False)
 
-        siblings = [
-            w for w in self.master.winfo_children()
-            if isinstance(w, BaseWidget) and w is not self
-        ]
-        if not siblings:
-            self._tile_x, self._tile_y = 20, 20
-        else:
-            last = siblings[-1]
-            if last._tile_x + last._tile_w + self._tile_w + 40 <= 1140:
-                self._tile_x = last._tile_x + last._tile_w + 20
-                self._tile_y = last._tile_y
+            siblings = [
+                w for w in self.master.winfo_children()
+                if isinstance(w, BaseWidget) and w is not self
+            ]
+            if not siblings:
+                self._tile_x, self._tile_y = 20, 20
             else:
-                max_bottom = max(w._tile_y + w._tile_h for w in siblings)
-                self._tile_x = 20
-                self._tile_y = max_bottom + 20
+                last = siblings[-1]
+                if last._tile_x + last._tile_w + self._tile_w + 40 <= 1140:
+                    self._tile_x = last._tile_x + last._tile_w + 20
+                    self._tile_y = last._tile_y
+                else:
+                    max_bottom = max(w._tile_y + w._tile_h for w in siblings)
+                    self._tile_x = 20
+                    self._tile_y = max_bottom + 20
 
-        self.place(x=self._tile_x, y=self._tile_y)
-        self._install_drag_and_resize_handles()
-        self._update_canvas_height()
+            self.place(x=self._tile_x, y=self._tile_y)
+            self._install_drag_and_resize_handles()
+            self._update_canvas_height()
+            self.after(15, self._adopt_children_into_viewport)
+            return
+
+        super().pack(*args, **kwargs)
+        self.after(15, self._adopt_children_into_viewport)
 
     def _install_drag_and_resize_handles(self):
-        # 1. Top-left Drag Handle ("⠿")
         self.drag_handle = ctk.CTkLabel(
             self,
             text="⠿",
@@ -90,13 +249,12 @@ class BaseWidget(ctk.CTkFrame):
             height=18,
             cursor="fleur",
         )
-        self.drag_handle.place(x=3, y=3)
+        self.drag_handle.place(x=3, y=2)
 
         for target in (self.drag_handle, self):
             target.bind("<ButtonPress-1>", self._on_drag_start)
             target.bind("<B1-Motion>", self._on_drag_motion)
 
-        # 2. Bottom-right Resize Grip ("◢")
         self.resize_grip = ctk.CTkLabel(
             self,
             text="◢",
@@ -106,17 +264,17 @@ class BaseWidget(ctk.CTkFrame):
             height=16,
             cursor="size_nw_se",
         )
-        self.resize_grip.place(relx=1.0, rely=1.0, x=-3, y=-3, anchor="se")
+        self.resize_grip.place(relx=1.0, rely=1.0, x=-2, y=-2, anchor="se")
         self.resize_grip.bind("<ButtonPress-1>", self._on_resize_start)
         self.resize_grip.bind("<B1-Motion>", self._on_resize_motion)
 
-        # Raise handles above inner frames after subclass __init__ finishes
-        self.after(20, self._lift_handles)
+        self.after(25, self._lift_handles)
 
     def _lift_handles(self):
         if self.winfo_exists():
             self.drag_handle.lift()
             self.resize_grip.lift()
+            self._sync_scrollbars()
 
     def _on_drag_start(self, event):
         self.lift()
@@ -143,8 +301,8 @@ class BaseWidget(ctk.CTkFrame):
     def _on_resize_motion(self, event):
         dx = event.x_root - self._resize_start_x
         dy = event.y_root - self._resize_start_y
-        new_w = max(320, round((self._resize_start_w + dx) / self.GRID_SNAP) * self.GRID_SNAP)
-        new_h = max(100, round((self._resize_start_h + dy) / self.GRID_SNAP) * self.GRID_SNAP)
+        new_w = max(220, round((self._resize_start_w + dx) / self.GRID_SNAP) * self.GRID_SNAP)
+        new_h = max(90, round((self._resize_start_h + dy) / self.GRID_SNAP) * self.GRID_SNAP)
         if new_w != self._tile_w or new_h != self._tile_h:
             self._tile_w = new_w
             self._tile_h = new_h
@@ -162,7 +320,6 @@ class BaseWidget(ctk.CTkFrame):
         self._update_canvas_height()
 
     def _update_canvas_height(self):
-        """Keeps an invisible spacer inside CTkScrollableFrame so the scrollbar tracks .place() tiles."""
         siblings = [w for w in self.master.winfo_children() if isinstance(w, BaseWidget)]
         max_bottom = max((w._tile_y + w._tile_h for w in siblings), default=600)
         try:
@@ -203,7 +360,8 @@ class BaseWidget(ctk.CTkFrame):
             return addr_str if addr_str.startswith("0x") else "0x" + addr_str
         except ValueError:
             return None
-        
+
+
 class VarSlider(BaseWidget):
     # --- WRITE SLIDER WIDGET ---
     def __init__(self, parent, app):
@@ -218,7 +376,7 @@ class VarSlider(BaseWidget):
         self.slider_timer = None
 
         config_frame = ctk.CTkFrame(self, fg_color="transparent")
-        config_frame.pack(fill="x", padx=10, pady=(10, 5))
+        config_frame.pack(fill="x", padx=10, pady=(4, 4))
 
         ctk.CTkLabel(config_frame, text="Write | Addr/Name:").grid(row=0, column=0, padx=5)
         ctk.CTkEntry(config_frame, textvariable=self.var_name, width=140).grid(row=0, column=1, padx=5)
@@ -241,10 +399,10 @@ class VarSlider(BaseWidget):
         ctk.CTkButton(config_frame, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).grid(row=0, column=9, padx=5)
 
         self.current_val_label = ctk.CTkLabel(self, text="Target Value: 0", font=("Consolas", 14, "bold"), text_color="#4CAF50")
-        self.current_val_label.pack(pady=(5, 0))
+        self.current_val_label.pack(pady=(2, 0))
 
         self.slider = ctk.CTkSlider(self, from_=0, to=255)
-        self.slider.pack(fill="x", padx=15, pady=(5, 15))
+        self.slider.pack(fill="x", padx=15, pady=(4, 10))
         self.slider.configure(command=self.on_slider_change)
         self.slider.set(0)
 
@@ -287,9 +445,11 @@ class VarSlider(BaseWidget):
 
         def _write_task():
             with self.app.jtag_lock:
+                if getattr(self.app, "abort_transfers", False):
+                    return
                 try:
                     with OpenOCDSession(timeout=2.0) as ocd:
-                        state = ocd.send("[[target current] curstate]")
+                        state = ocd.send("[target current] curstate")
                         was_running = "running" in state
                         if was_running:
                             ocd.send("halt; wait_halt")
@@ -333,7 +493,7 @@ class EnumSelectorWidget(BaseWidget):
         self.current_selection = ctk.StringVar(value="OFF")
 
         config_frame = ctk.CTkFrame(self, fg_color="transparent")
-        config_frame.pack(fill="x", padx=10, pady=(10, 5))
+        config_frame.pack(fill="x", padx=10, pady=(4, 4))
 
         ctk.CTkLabel(config_frame, text="Choice | Addr/Name:").grid(row=0, column=0, padx=5)
         ctk.CTkEntry(config_frame, textvariable=self.var_name, width=140).grid(row=0, column=1, padx=5)
@@ -349,15 +509,15 @@ class EnumSelectorWidget(BaseWidget):
         ctk.CTkButton(config_frame, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).grid(row=0, column=4, padx=10)
 
         choices_frame = ctk.CTkFrame(self, fg_color="transparent")
-        choices_frame.pack(fill="x", padx=10, pady=(0, 5))
+        choices_frame.pack(fill="x", padx=10, pady=(0, 4))
 
         ctk.CTkLabel(choices_frame, text="Values [Label:Val, ...]:").pack(side="left", padx=5)
-        self.choices_entry = ctk.CTkEntry(choices_frame, textvariable=self.choices_str, width=320)
+        self.choices_entry = ctk.CTkEntry(choices_frame, textvariable=self.choices_str, width=260)
         self.choices_entry.pack(side="left", padx=5, fill="x", expand=True)
         ctk.CTkButton(choices_frame, text="Set Choices", width=95, command=self.rebuild_buttons).pack(side="left", padx=5)
 
         self.btn_container = ctk.CTkFrame(self, fg_color="#1E1E1E", corner_radius=6)
-        self.btn_container.pack(fill="x", padx=15, pady=(5, 12))
+        self.btn_container.pack(fill="x", padx=15, pady=(4, 10))
 
         self.parsed_choices = {}
         self.segmented_btn = None
@@ -400,6 +560,7 @@ class EnumSelectorWidget(BaseWidget):
             command=self.on_choice_selected,
         )
         self.segmented_btn.pack(fill="x", padx=10, pady=8)
+        self.after(20, self._on_inner_configure)
 
     def on_choice_selected(self, label):
         if not self.winfo_exists():
@@ -439,6 +600,8 @@ class EnumSelectorWidget(BaseWidget):
 
         def _write_task():
             with self.app.jtag_lock:
+                if getattr(self.app, "abort_transfers", False):
+                    return
                 try:
                     with OpenOCDSession(timeout=2.0) as ocd:
                         state = ocd.send("[target current] curstate")
@@ -499,9 +662,10 @@ class ReadMonitor(BaseWidget):
         self.y_max = ctk.StringVar(value="100")
 
         self.y_data = deque(maxlen=100)
+        self._busy = False
 
         config_frame = ctk.CTkFrame(self, fg_color="transparent")
-        config_frame.pack(fill="x", padx=10, pady=(10, 5))
+        config_frame.pack(fill="x", padx=10, pady=(4, 4))
 
         ctk.CTkLabel(config_frame, text="Read | Addr/Name:").grid(row=0, column=0, padx=(5, 2))
         ctk.CTkEntry(config_frame, textvariable=self.var_name, width=130).grid(row=0, column=1, padx=2)
@@ -523,7 +687,7 @@ class ReadMonitor(BaseWidget):
         ctk.CTkButton(config_frame, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).grid(row=0, column=8, padx=(10, 5))
 
         display_frame = ctk.CTkFrame(self, fg_color="transparent")
-        display_frame.pack(fill="x", padx=15, pady=(5, 10))
+        display_frame.pack(fill="x", padx=15, pady=(4, 8))
 
         self.value_label = ctk.CTkLabel(display_frame, text="0", font=("Consolas", 20, "bold"), width=120, anchor="w")
         self.value_label.pack(side="left", padx=(0, 15))
@@ -592,19 +756,30 @@ class ReadMonitor(BaseWidget):
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
+    def _recalc_read_tile_height(self):
+        h = 145
+        if self.show_bitfields.get():
+            h += 145
+        if self.show_plot.get():
+            h += 245
+        self.set_tile_size(h=h)
+        self.after(20, self._on_inner_configure)
+
     def toggle_bitfields(self):
         if self.show_bitfields.get():
-            self.bf_frame.pack(fill="x", padx=15, pady=(0, 10))
+            self.bf_frame.pack(fill="x", padx=15, pady=(0, 10), in_=self._inner_frame)
             self.execute_read()
         else:
             self.bf_frame.pack_forget()
+        self._recalc_read_tile_height()
 
     def toggle_plot(self):
         if self.show_plot.get():
-            self.plot_frame.pack(fill="x", padx=15, pady=(0, 15))
+            self.plot_frame.pack(fill="x", padx=15, pady=(0, 12), in_=self._inner_frame)
             self.update_plot_visuals()
         else:
             self.plot_frame.pack_forget()
+        self._recalc_read_tile_height()
 
     def clear_plot(self):
         self.y_data.clear()
@@ -617,12 +792,10 @@ class ReadMonitor(BaseWidget):
     def execute_read(self, halted_only=False):
         if not self.winfo_exists():
             return
-        # If user manually clicks Read Now after stopping OpenOCD, clear the abort latch
         if not self.auto_poll.get() and not halted_only:
             self.app.abort_transfers = False
 
-        # Drop overlapping poll ticks so threads never pile up in a queue
-        if getattr(self, "_busy", False) and not halted_only:
+        if self._busy and not halted_only:
             return
 
         name = self.var_name.get()
@@ -650,8 +823,7 @@ class ReadMonitor(BaseWidget):
         def _read_task():
             try:
                 with self.app.jtag_lock:
-                    # Immediately exit if OpenOCD was stopped while this thread waited for the lock
-                    if self.app.abort_transfers:
+                    if getattr(self.app, "abort_transfers", False):
                         return
                     try:
                         with OpenOCDSession(timeout=2.0) as ocd:
@@ -667,14 +839,18 @@ class ReadMonitor(BaseWidget):
                                     read_output = ocd.send(f"{mem_cmd} {addr}")
                                     ocd.send("resume")
 
-                            if not self.app.abort_transfers:
+                            if not getattr(self.app, "abort_transfers", False):
                                 self.after(0, lambda: self.process_read_result(read_output))
                     except Exception:
                         pass
             finally:
                 self._busy = False
-                # Schedule next poll ONLY after current read completes (prevents queue build-up)
-                if self.winfo_exists() and self.auto_poll.get() and not halted_only and not self.app.abort_transfers:
+                if (
+                    self.winfo_exists()
+                    and self.auto_poll.get()
+                    and not halted_only
+                    and not getattr(self.app, "abort_transfers", False)
+                ):
                     self.after(interval, self.execute_read)
 
         threading.Thread(target=_read_task, daemon=True).start()
@@ -840,9 +1016,10 @@ class MemBlockPlotter(BaseWidget):
 
         self.auto_poll = ctk.BooleanVar(value=False)
         self.poll_interval = ctk.StringVar(value="1000")
+        self._busy = False
 
         config_frame = ctk.CTkFrame(self, fg_color="transparent")
-        config_frame.pack(fill="x", padx=10, pady=(10, 5))
+        config_frame.pack(fill="x", padx=10, pady=(4, 4))
 
         ctk.CTkLabel(config_frame, text="Block Dump | Addr:").grid(row=0, column=0, padx=(5, 2))
         ctk.CTkEntry(config_frame, textvariable=self.base_addr, width=120).grid(row=0, column=1, padx=2)
@@ -867,7 +1044,7 @@ class MemBlockPlotter(BaseWidget):
         ctk.CTkLabel(action_frame, text="ms").pack(side="right", padx=(0, 5))
         ctk.CTkSwitch(action_frame, text="Auto", variable=self.auto_poll, command=self.toggle_poll).pack(side="right", padx=(10, 5))
 
-        self.fig = Figure(figsize=(8, 3.5), dpi=100)
+        self.fig = Figure(figsize=(8, 3.0), dpi=100)
         self.fig.patch.set_facecolor("#242424")
         self.fig.subplots_adjust(left=0.08, right=0.98, top=0.9, bottom=0.15)
         self.ax = self.fig.add_subplot(111)
@@ -875,7 +1052,7 @@ class MemBlockPlotter(BaseWidget):
 
         self.last_values = []
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(5, 10))
+        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(4, 8))
 
     def setup_axes(self):
         self.ax.set_facecolor("#1E1E1E")
@@ -897,7 +1074,7 @@ class MemBlockPlotter(BaseWidget):
         if not self.auto_poll.get() and not halted_only:
             self.app.abort_transfers = False
 
-        if getattr(self, "_busy", False) and not halted_only:
+        if self._busy and not halted_only:
             return
 
         name = self.base_addr.get()
@@ -925,7 +1102,7 @@ class MemBlockPlotter(BaseWidget):
         def _dump_task():
             try:
                 with self.app.jtag_lock:
-                    if self.app.abort_transfers:
+                    if getattr(self.app, "abort_transfers", False):
                         return
                     try:
                         with OpenOCDSession(timeout=3.0) as ocd:
@@ -941,13 +1118,18 @@ class MemBlockPlotter(BaseWidget):
                                     raw_data = ocd.send(f"{cmd} {addr} {count}")
                                     ocd.send("resume")
 
-                            if not self.app.abort_transfers:
+                            if not getattr(self.app, "abort_transfers", False):
                                 self.after(0, lambda: self.process_dump(raw_data))
                     except Exception:
                         pass
             finally:
                 self._busy = False
-                if self.winfo_exists() and self.auto_poll.get() and not halted_only and not self.app.abort_transfers:
+                if (
+                    self.winfo_exists()
+                    and self.auto_poll.get()
+                    and not halted_only
+                    and not getattr(self.app, "abort_transfers", False)
+                ):
                     self.after(interval, self.execute_dump)
 
         threading.Thread(target=_dump_task, daemon=True).start()
@@ -1028,7 +1210,7 @@ class MemFileLoader(BaseWidget):
         self.file_data = []
 
         config_frame = ctk.CTkFrame(self, fg_color="transparent")
-        config_frame.pack(fill="x", padx=10, pady=(10, 5))
+        config_frame.pack(fill="x", padx=10, pady=(4, 4))
 
         ctk.CTkLabel(config_frame, text="File Loader | Addr/Name:").grid(row=0, column=0, padx=5)
         ctk.CTkEntry(config_frame, textvariable=self.base_addr, width=130).grid(row=0, column=1, padx=5)
@@ -1040,10 +1222,10 @@ class MemFileLoader(BaseWidget):
         ctk.CTkButton(config_frame, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).grid(row=0, column=5, padx=5)
 
         self.status_label = ctk.CTkLabel(self, text="No file selected.", text_color="gray", font=("Consolas", 12))
-        self.status_label.pack(pady=5)
+        self.status_label.pack(pady=4)
 
         self.upload_btn = ctk.CTkButton(self, text="Upload to Target", fg_color="#F57C00", hover_color="#E65100", command=self.execute_upload, state="disabled")
-        self.upload_btn.pack(pady=(0, 15))
+        self.upload_btn.pack(pady=(0, 10))
 
     def load_file(self):
         fp = filedialog.askopenfilename(filetypes=[("Text/Hex Files", "*.txt *.hex *.dat"), ("All Files", "*.*")])
@@ -1084,15 +1266,20 @@ class MemFileLoader(BaseWidget):
 
         def _upload_task():
             with self.app.jtag_lock:
+                if getattr(self.app, "abort_transfers", False):
+                    self.after(0, lambda: self.upload_btn.configure(state="normal"))
+                    return
                 try:
                     with OpenOCDSession(timeout=5.0) as ocd:
-                        state = ocd.send("[[target current] curstate]")
+                        state = ocd.send("[target current] curstate")
                         was_running = "running" in state
                         if was_running:
                             ocd.send("halt; wait_halt")
 
                         batch_size = 30
                         for i in range(0, len(self.file_data), batch_size):
+                            if getattr(self.app, "abort_transfers", False):
+                                break
                             batch = self.file_data[i : i + batch_size]
                             cmd_string = ""
                             for j, val in enumerate(batch):
@@ -1132,9 +1319,10 @@ class AliveLightWidget(BaseWidget):
         self.var_type = ctk.StringVar(value="uint8")
         self.auto_poll = ctk.BooleanVar(value=False)
         self.poll_interval = ctk.StringVar(value="500")
+        self._busy = False
 
         config_frame = ctk.CTkFrame(self, fg_color="transparent")
-        config_frame.pack(fill="x", padx=10, pady=(10, 5))
+        config_frame.pack(fill="x", padx=10, pady=(4, 4))
 
         ctk.CTkLabel(config_frame, text="Alive Light | Addr:").grid(row=0, column=0, padx=(5, 2))
         ctk.CTkEntry(config_frame, textvariable=self.var_name, width=130).grid(row=0, column=1, padx=2)
@@ -1145,7 +1333,7 @@ class AliveLightWidget(BaseWidget):
         ctk.CTkButton(config_frame, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).grid(row=0, column=4, padx=(15, 5))
 
         display_frame = ctk.CTkFrame(self, fg_color="transparent")
-        display_frame.pack(fill="x", padx=15, pady=(5, 10))
+        display_frame.pack(fill="x", padx=15, pady=(4, 8))
 
         self.light = ctk.CTkLabel(display_frame, text="", width=30, height=30, corner_radius=15, fg_color="#424242")
         self.light.pack(side="left", padx=(10, 15))
@@ -1171,7 +1359,7 @@ class AliveLightWidget(BaseWidget):
         if not self.auto_poll.get() and not halted_only:
             self.app.abort_transfers = False
 
-        if getattr(self, "_busy", False) and not halted_only:
+        if self._busy and not halted_only:
             return
 
         name = self.var_name.get()
@@ -1194,7 +1382,7 @@ class AliveLightWidget(BaseWidget):
         def _read_task():
             try:
                 with self.app.jtag_lock:
-                    if self.app.abort_transfers:
+                    if getattr(self.app, "abort_transfers", False):
                         return
                     try:
                         with OpenOCDSession(timeout=2.0) as ocd:
@@ -1210,269 +1398,22 @@ class AliveLightWidget(BaseWidget):
                                     output = ocd.send(f"{cmd} {addr}")
                                     ocd.send("resume")
 
-                            if not self.app.abort_transfers:
+                            if not getattr(self.app, "abort_transfers", False):
                                 self.after(0, lambda: self.process_read(output))
                     except Exception:
-                        if not self.app.abort_transfers:
+                        if not getattr(self.app, "abort_transfers", False):
                             self.after(0, lambda: self.set_error("Comm Error"))
             finally:
                 self._busy = False
-                if self.winfo_exists() and self.auto_poll.get() and not halted_only and not self.app.abort_transfers:
+                if (
+                    self.winfo_exists()
+                    and self.auto_poll.get()
+                    and not halted_only
+                    and not getattr(self.app, "abort_transfers", False)
+                ):
                     self.after(interval, self.execute_read)
 
         threading.Thread(target=_read_task, daemon=True).start()
-
-    def process_read(self, output):
-        if not self.winfo_exists():
-            return
-        match = re.search(r":\s*([0-9a-fA-F]+)", output)
-        if match:
-            val = int(match.group(1), 16)
-            if val > 0:
-                self.light.configure(fg_color="#00E676")
-                self.status_lbl.configure(text=f"TRUE ({val})", text_color="#00E676")
-            else:
-                self.light.configure(fg_color="#424242")
-                self.status_lbl.configure(text="FALSE (0)", text_color="gray")
-        else:
-            self.set_error("Parse Error")
-
-    def set_error(self, msg):
-        if self.winfo_exists():
-            self.light.configure(fg_color="#D50000")
-            self.status_lbl.configure(text=msg, text_color="#D50000")
-
-    def get_state(self):
-        return {
-            "widget_type": "alive_light",
-            "var_name": self.var_name.get(),
-            "var_type": self.var_type.get(),
-            "poll_interval": self.poll_interval.get(),
-        }
-
-    def set_state(self, state):
-        self.var_name.set(state.get("var_name", "system_alive"))
-        self.var_type.set(state.get("var_type", "uint8"))
-        self.poll_interval.set(state.get("poll_interval", "500"))
-        if state.get("auto_poll", False):
-            self.auto_poll.set(True)
-            self.toggle_poll()
-
-class EnumSelectorWidget(BaseWidget):
-    # --- DISCRETE ENUM / CHOICE SWITCHER WIDGET ---
-    def __init__(self, parent, app):
-        super().__init__(parent, corner_radius=10, border_width=2, border_color="#3F51B5")
-        self.app = app
-        self.pack(fill="x", pady=10, padx=10)
-        
-        self.var_name = ctk.StringVar(value="operating_mode")
-        self.var_type = ctk.StringVar(value="uint32")
-        
-        # Default options: Label -> Value string
-        self.choices_str = ctk.StringVar(value="IDLE:0, RUN:1, BOOST:2, FAULT:3")
-        self.current_selection = ctk.StringVar(value="IDLE")
-        
-        config_frame = ctk.CTkFrame(self, fg_color="transparent")
-        config_frame.pack(fill="x", padx=10, pady=(10, 5))
-        
-        ctk.CTkLabel(config_frame, text="Choice | Addr/Name:").grid(row=0, column=0, padx=5)
-        ctk.CTkEntry(config_frame, textvariable=self.var_name, width=130).grid(row=0, column=1, padx=5)
-        
-        ctk.CTkLabel(config_frame, text="Type:").grid(row=0, column=2, padx=5)
-        ctk.CTkComboBox(
-            config_frame, 
-            variable=self.var_type, 
-            values=["uint8", "uint16", "uint32", "int8", "int16", "int32", "float"], 
-            width=85
-        ).grid(row=0, column=3, padx=5)
-        
-        ctk.CTkButton(config_frame, text="X", width=30, fg_color="#C62828", hover_color="#b71c1c", command=self.destroy).grid(row=0, column=4, padx=5)
-
-        # Choices configuration row
-        choices_frame = ctk.CTkFrame(self, fg_color="transparent")
-        choices_frame.pack(fill="x", padx=10, pady=(0, 5))
-        
-        ctk.CTkLabel(choices_frame, text="Values [Label:Val, ...]:").pack(side="left", padx=5)
-        self.choices_entry = ctk.CTkEntry(choices_frame, textvariable=self.choices_str, width=320)
-        self.choices_entry.pack(side="left", padx=5, fill="x", expand=True)
-        ctk.CTkButton(choices_frame, text="Set Choices", width=90, command=self.rebuild_buttons).pack(side="left", padx=5)
-
-        # Segmented button container
-        self.btn_container = ctk.CTkFrame(self, fg_color="#1E1E1E", corner_radius=6)
-        self.btn_container.pack(fill="x", padx=15, pady=(5, 12))
-        
-        self.parsed_choices = {}  # {"IDLE": 0, "RUN": 1, ...}
-        self.segmented_btn = None
-        self.rebuild_buttons()
-
-    def rebuild_buttons(self):
-        # Parse "Label:Value, Label2:Value2"
-        raw = self.choices_str.get()
-        self.parsed_choices.clear()
-        
-        pairs = raw.split(",")
-        for pair in pairs:
-            if ":" in pair:
-                parts = pair.split(":")
-                label = parts[0].strip()
-                val_str = parts[1].strip()
-                try:
-                    # Support floats, hex (0x...), and ints
-                    if "." in val_str or "f" in val_str.lower():
-                        val = float(val_str.lower().replace("f", ""))
-                    elif val_str.startswith("0x") or val_str.startswith("0X"):
-                        val = int(val_str, 16)
-                    else:
-                        val = int(val_str)
-                    self.parsed_choices[label] = val
-                except ValueError:
-                    pass
-
-        if not self.parsed_choices:
-            self.parsed_choices = {"DEFAULT": 0}
-
-        # Clear old segmented button if it exists
-        if self.segmented_btn:
-            self.segmented_btn.destroy()
-
-        labels = list(self.parsed_choices.keys())
-        if self.current_selection.get() not in labels:
-            self.current_selection.set(labels[0])
-
-        self.segmented_btn = ctk.CTkSegmentedButton(
-            self.btn_container,
-            values=labels,
-            variable=self.current_selection,
-            command=self.on_choice_selected
-        )
-        self.segmented_btn.pack(fill="x", padx=10, pady=8)
-
-    def on_choice_selected(self, label):
-        if not self.winfo_exists():
-            return
-        val = self.parsed_choices.get(label)
-        if val is not None:
-            self.execute_write(val)
-
-    def execute_write(self, value):
-        if not self.winfo_exists():
-            return
-        name = self.var_name.get()
-        addr = self.get_resolved_addr(name)
-        if not addr:
-            self.app.log_msg(f"Wait: '{name}' is not a valid map symbol or hex address!")
-            return
-
-        v_type = self.var_type.get()
-        
-        # Handle Float formatting (IEEE-754 hex conversion)
-        if v_type == "float":
-            try:
-                packed = struct.pack('<f', float(value))
-                int_val = struct.unpack('<I', packed)[0]
-                hex_val = f"0x{int_val:08X}"
-                mem_cmd = "mww"
-            except Exception as e:
-                self.app.log_msg(f"Float Write ERROR: {e}")
-                return
-        else:
-            # Handle signed/unsigned integers
-            if isinstance(value, float):
-                value = int(value)
-            if value < 0:
-                bits = 8 if "8" in v_type else (16 if "16" in v_type else 32)
-                value = (1 << bits) + value
-
-            cmd_map = {"8": "mwb", "16": "mwh", "32": "mww"}
-            mem_cmd = cmd_map.get(v_type.replace("uint", "").replace("int", ""), "mww")
-            hex_val = hex(value)
-
-        def _write_task():
-            with self.app.jtag_lock:
-                try:
-                    with OpenOCDSession(timeout=2.0) as ocd:
-                        state = ocd.send("[[target current] curstate]")
-                        was_running = "running" in state
-                        if was_running:
-                            ocd.send("halt; wait_halt")
-                        ocd.send(f"{mem_cmd} {addr} {hex_val}")
-                        if was_running and not self.app.target_halted_at_bp:
-                            ocd.send("resume")
-                        self.after(0, lambda: self.app.log_msg(f"Enum Write: set '{name}' to {self.current_selection.get()} ({hex_val})"))
-                except Exception as e:
-                    self.after(0, lambda: self.app.log_msg(f"Enum Write ERROR: {str(e)}"))
-
-        threading.Thread(target=_write_task, daemon=True).start()
-
-    def get_state(self):
-        return {
-            "widget_type": "enum_selector",
-            "var_name": self.var_name.get(),
-            "var_type": self.var_type.get(),
-            "choices_str": self.choices_str.get(),
-            "current_selection": self.current_selection.get()
-        }
-
-    def set_state(self, state):
-        self.var_name.set(state.get("var_name", "operating_mode"))
-        self.var_type.set(state.get("var_type", "uint32"))
-        self.choices_str.set(state.get("choices_str", "IDLE:0, RUN:1, BOOST:2, FAULT:3"))
-        self.rebuild_buttons()
-        sel = state.get("current_selection")
-        if sel in self.parsed_choices:
-            self.current_selection.set(sel)
-
-    def toggle_poll(self):
-        if self.auto_poll.get():
-            self.execute_read()
-        else:
-            self.light.configure(fg_color="#424242")
-            self.status_lbl.configure(text="Stopped", text_color="gray")
-
-    def execute_read(self, halted_only=False):
-        if not self.winfo_exists():
-            return
-
-        name = self.var_name.get()
-        addr = self.get_resolved_addr(name)
-        if not addr:
-            self.set_error("Invalid Address")
-            self.auto_poll.set(False)
-            return
-
-        try:
-            interval = max(50, int(self.poll_interval.get()))
-        except ValueError:
-            interval = 500
-            self.poll_interval.set("500")
-
-        v_type = self.var_type.get()
-        cmd = "mdb" if "8" in v_type else ("mdh" if "16" in v_type else "mdw")
-
-        def _read_task():
-            with self.app.jtag_lock:
-                try:
-                    with OpenOCDSession(timeout=2.0) as ocd:
-                        if halted_only or self.app.target_halted_at_bp:
-                            output = ocd.send(f"{cmd} {addr}")
-                        else:
-                            state = ocd.send("[[target current] curstate]")
-                            if "halted" in state:
-                                self.after(0, self.app.disable_all_auto_poll)
-                                output = ocd.send(f"{cmd} {addr}")
-                            else:
-                                ocd.send("halt; wait_halt")
-                                output = ocd.send(f"{cmd} {addr}")
-                                ocd.send("resume")
-
-                        self.after(0, lambda: self.process_read(output))
-                except Exception:
-                    self.after(0, lambda: self.set_error("Comm Error"))
-
-        threading.Thread(target=_read_task, daemon=True).start()
-
-        if self.auto_poll.get() and not halted_only:
-            self.after(interval, self.execute_read)
 
     def process_read(self, output):
         if not self.winfo_exists():
