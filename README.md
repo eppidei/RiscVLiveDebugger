@@ -31,8 +31,11 @@ Developing real-time embedded firmware on FPGA soft-cores (such as the Microchip
 
 ### The Solution
 
-> **Attach-Only Workflow Note:** This dashboard is designed to **attach to an already-programmed/running target** via OpenOCD for live telemetry, parameter tuning, memory block inspection, and breakpoint snapshots—it is **not** a firmware flasher or a full source-level step debugger. Program/flash your firmware image using your normal build/programming flow (e.g., SoftConsole / FlashPro / OpenOCD flash script) first, then load the matching `.map` file (and optional `.lst` file) here to attach and inspect live state.
-This tool bypasses GDB entirely. It communicates with OpenOCD via a lightweight TCP/IP socket connection directly to its TCL command interface (port 6666). For live telemetry and tuning, the core is halted, inspected or modified, and resumed within microsecond windows. For deterministic fault-catching, native RISC-V hardware triggers (`bp` and `wp`) halt the target at full clock speed and capture a cycle-coherent snapshot of all firmware variables in a single pass.
+This tool bypasses GDB entirely and is built as a **live-attach instrumentation and tuning dashboard** rather than a firmware flasher or a full source-level step debugger. It communicates directly with OpenOCD's TCL command interface (`port 6666`) to attach to an already-programmed or running target:
+
+- **Low-Intrusion Live Tuning & Telemetry:** For routine monitoring and parameter adjustments, the core is briefly halted, inspected or updated, and resumed within microsecond windows—avoiding heavy GDB sessions and prolonged halts that disrupt real-time control loops.
+- **Cycle-Coherent Breakpoint Snapshots:** For deterministic fault-catching, native RISC-V hardware triggers (`bp` and `wp`) halt the target at full clock speed and capture a single-pass snapshot of firmware variables.
+- **Scoped Data Loading (Not Firmware Flashing):** While the Memory File Loader (`MemFileLoader`) can write data blocks or buffers (such as LUTs, coefficients, or test vectors) into target memory, flashing full executable images, managing flash controllers, or running step-by-step source debugging remains outside this tool's scope and should be handled via your normal build/programming workflow (e.g., SoftConsole, FlashPro, or dedicated OpenOCD flash scripts).
 
 ---
 
