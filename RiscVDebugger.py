@@ -46,6 +46,7 @@ class ModernOpenOCD_GUI(ctk.CTk):
 
         self.jtag_lock = threading.Lock()
         self.target_halted_at_bp = False
+        self.abort_transfers = False
         self.ocd_process = None
 
         self.ocd_exe_path = ctk.StringVar()
@@ -160,11 +161,28 @@ class ModernOpenOCD_GUI(ctk.CTk):
         author_lbl.pack(side="left")
 
     def disable_all_auto_poll(self):
+        """Disables Auto Poll on all instantiated widgets immediately."""
         for widget in self.scrollable_frame.winfo_children():
             if hasattr(widget, "auto_poll") and widget.auto_poll.get():
                 widget.auto_poll.set(False)
                 if isinstance(widget, AliveLightWidget):
                     widget.toggle_poll()
+
+    def stop_all_activity(self):
+        """Flushes queued JTAG threads, stops all auto-polling, and disarms breakpoint timers."""
+        self.abort_transfers = True
+        self.target_halted_at_bp = False
+        self.disable_all_auto_poll()
+        for widget in self.scrollable_frame.winfo_children():
+            if hasattr(widget, "is_armed") and widget.is_armed:
+                widget.is_armed = False
+                widget.is_halted_here = False
+                if hasattr(widget, "arm_btn"):
+                    widget.arm_btn.configure(text="Arm Breakpoint", fg_color="#00838F", hover_color="#006064")
+                if hasattr(widget, "resume_btn"):
+                    widget.resume_btn.configure(state="disabled")
+                if hasattr(widget, "status_lbl"):
+                    widget.status_lbl.configure(text="Status: Disarmed", text_color="gray")
 
     def refresh_other_widgets_halted(self):
         for widget in self.scrollable_frame.winfo_children():
@@ -196,17 +214,21 @@ class ModernOpenOCD_GUI(ctk.CTk):
                 self.log_msg("ERROR: Must select both OpenOCD exe and a .cfg file.")
                 return
             try:
+                self.abort_transfers = False
                 self.ocd_process = start_openocd_console(exe, cfg)
                 self.btn_start_ocd.configure(text="Stop OpenOCD", fg_color="#C62828", hover_color="#b71c1c")
                 self.log_msg("OpenOCD started in colorized console window.")
             except Exception as e:
                 self.log_msg(f"Failed to start OpenOCD: {e}")
         else:
+            # 1. Immediately halt all GUI timers and tell queued threads to abort
+            self.stop_all_activity()
+            # 2. Terminate the OpenOCD process
             stop_openocd_console(self.ocd_process)
             self.ocd_process = None
             self.btn_start_ocd.configure(text="Start OpenOCD", fg_color="#00695C", hover_color="#004D40")
-            self.log_msg("OpenOCD server stopped.")
-
+            self.log_msg("OpenOCD server stopped. All polling and queued reads flushed.")
+            
     def reset_target(self):
         def _task():
             with self.jtag_lock:

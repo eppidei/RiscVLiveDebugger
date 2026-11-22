@@ -7,16 +7,20 @@ import subprocess
 
 class OpenOCDSession:
     """Context manager for atomic OpenOCD TCL socket transactions (port 6666)."""
-    def __init__(self, host="localhost", port=6666, timeout=2.0):
+    def __init__(self, host="127.0.0.1", port=6666, timeout=2.0, connect_timeout=0.3):
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.connect_timeout = connect_timeout
         self.sock = None
 
     def __enter__(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
+        # Fast timeout for TCP handshake so a stopped OpenOCD fails in 0.3s instead of 2.0s
+        self.sock.settimeout(self.connect_timeout)
         self.sock.connect((self.host, self.port))
+        # Restore normal timeout for JTAG commands once connected
+        self.sock.settimeout(self.timeout)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -28,7 +32,6 @@ class OpenOCDSession:
 
     def send(self, command: str) -> str:
         """Sends a TCL command terminated with 0x1A and returns the response string."""
-        # Prevent double-bracket evaluation ('invalid command name "running"') in JimTCL
         if command.strip() == "[[target current] curstate]":
             command = "[target current] curstate"
 

@@ -617,6 +617,13 @@ class ReadMonitor(BaseWidget):
     def execute_read(self, halted_only=False):
         if not self.winfo_exists():
             return
+        # If user manually clicks Read Now after stopping OpenOCD, clear the abort latch
+        if not self.auto_poll.get() and not halted_only:
+            self.app.abort_transfers = False
+
+        # Drop overlapping poll ticks so threads never pile up in a queue
+        if getattr(self, "_busy", False) and not halted_only:
+            return
 
         name = self.var_name.get()
         addr = self.get_resolved_addr(name)
@@ -638,31 +645,39 @@ class ReadMonitor(BaseWidget):
         v_type = self.var_type.get()
         cmd_map = {"8": "mdb", "16": "mdh", "32": "mdw"}
         mem_cmd = cmd_map.get(v_type.replace("uint", "").replace("int", ""), "mdw")
+        self._busy = True
 
         def _read_task():
-            with self.app.jtag_lock:
-                try:
-                    with OpenOCDSession(timeout=2.0) as ocd:
-                        if halted_only or self.app.target_halted_at_bp:
-                            read_output = ocd.send(f"{mem_cmd} {addr}")
-                        else:
-                            state = ocd.send("[[target current] curstate]")
-                            if "halted" in state:
-                                self.after(0, self.app.disable_all_auto_poll)
+            try:
+                with self.app.jtag_lock:
+                    # Immediately exit if OpenOCD was stopped while this thread waited for the lock
+                    if self.app.abort_transfers:
+                        return
+                    try:
+                        with OpenOCDSession(timeout=2.0) as ocd:
+                            if halted_only or self.app.target_halted_at_bp:
                                 read_output = ocd.send(f"{mem_cmd} {addr}")
                             else:
-                                ocd.send("halt; wait_halt")
-                                read_output = ocd.send(f"{mem_cmd} {addr}")
-                                ocd.send("resume")
+                                state = ocd.send("[target current] curstate")
+                                if "halted" in state:
+                                    self.after(0, self.app.disable_all_auto_poll)
+                                    read_output = ocd.send(f"{mem_cmd} {addr}")
+                                else:
+                                    ocd.send("halt; wait_halt")
+                                    read_output = ocd.send(f"{mem_cmd} {addr}")
+                                    ocd.send("resume")
 
-                        self.after(0, lambda: self.process_read_result(read_output))
-                except Exception:
-                    pass
+                            if not self.app.abort_transfers:
+                                self.after(0, lambda: self.process_read_result(read_output))
+                    except Exception:
+                        pass
+            finally:
+                self._busy = False
+                # Schedule next poll ONLY after current read completes (prevents queue build-up)
+                if self.winfo_exists() and self.auto_poll.get() and not halted_only and not self.app.abort_transfers:
+                    self.after(interval, self.execute_read)
 
         threading.Thread(target=_read_task, daemon=True).start()
-
-        if self.auto_poll.get() and not halted_only:
-            self.after(interval, self.execute_read)
 
     def process_read_result(self, response):
         if not self.winfo_exists():
@@ -879,6 +894,11 @@ class MemBlockPlotter(BaseWidget):
     def execute_dump(self, halted_only=False):
         if not self.winfo_exists():
             return
+        if not self.auto_poll.get() and not halted_only:
+            self.app.abort_transfers = False
+
+        if getattr(self, "_busy", False) and not halted_only:
+            return
 
         name = self.base_addr.get()
         addr = self.get_resolved_addr(name)
@@ -900,31 +920,37 @@ class MemBlockPlotter(BaseWidget):
 
         ws = self.word_size.get()
         cmd = "mdb" if ws == "8" else ("mdh" if ws == "16" else "mdw")
+        self._busy = True
 
         def _dump_task():
-            with self.app.jtag_lock:
-                try:
-                    with OpenOCDSession(timeout=3.0) as ocd:
-                        if halted_only or self.app.target_halted_at_bp:
-                            raw_data = ocd.send(f"{cmd} {addr} {count}")
-                        else:
-                            state = ocd.send("[[target current] curstate]")
-                            if "halted" in state:
-                                self.after(0, self.app.disable_all_auto_poll)
+            try:
+                with self.app.jtag_lock:
+                    if self.app.abort_transfers:
+                        return
+                    try:
+                        with OpenOCDSession(timeout=3.0) as ocd:
+                            if halted_only or self.app.target_halted_at_bp:
                                 raw_data = ocd.send(f"{cmd} {addr} {count}")
                             else:
-                                ocd.send("halt; wait_halt")
-                                raw_data = ocd.send(f"{cmd} {addr} {count}")
-                                ocd.send("resume")
+                                state = ocd.send("[target current] curstate")
+                                if "halted" in state:
+                                    self.after(0, self.app.disable_all_auto_poll)
+                                    raw_data = ocd.send(f"{cmd} {addr} {count}")
+                                else:
+                                    ocd.send("halt; wait_halt")
+                                    raw_data = ocd.send(f"{cmd} {addr} {count}")
+                                    ocd.send("resume")
 
-                        self.after(0, lambda: self.process_dump(raw_data))
-                except Exception:
-                    pass
+                            if not self.app.abort_transfers:
+                                self.after(0, lambda: self.process_dump(raw_data))
+                    except Exception:
+                        pass
+            finally:
+                self._busy = False
+                if self.winfo_exists() and self.auto_poll.get() and not halted_only and not self.app.abort_transfers:
+                    self.after(interval, self.execute_dump)
 
         threading.Thread(target=_dump_task, daemon=True).start()
-
-        if self.auto_poll.get() and not halted_only:
-            self.after(interval, self.execute_dump)
 
     def process_dump(self, raw_text):
         if not self.winfo_exists():
@@ -1142,6 +1168,11 @@ class AliveLightWidget(BaseWidget):
     def execute_read(self, halted_only=False):
         if not self.winfo_exists():
             return
+        if not self.auto_poll.get() and not halted_only:
+            self.app.abort_transfers = False
+
+        if getattr(self, "_busy", False) and not halted_only:
+            return
 
         name = self.var_name.get()
         addr = self.get_resolved_addr(name)
@@ -1158,31 +1189,38 @@ class AliveLightWidget(BaseWidget):
 
         v_type = self.var_type.get()
         cmd = "mdb" if "8" in v_type else ("mdh" if "16" in v_type else "mdw")
+        self._busy = True
 
         def _read_task():
-            with self.app.jtag_lock:
-                try:
-                    with OpenOCDSession(timeout=2.0) as ocd:
-                        if halted_only or self.app.target_halted_at_bp:
-                            output = ocd.send(f"{cmd} {addr}")
-                        else:
-                            state = ocd.send("[target current] curstate")
-                            if "halted" in state:
-                                self.after(0, self.app.disable_all_auto_poll)
+            try:
+                with self.app.jtag_lock:
+                    if self.app.abort_transfers:
+                        return
+                    try:
+                        with OpenOCDSession(timeout=2.0) as ocd:
+                            if halted_only or self.app.target_halted_at_bp:
                                 output = ocd.send(f"{cmd} {addr}")
                             else:
-                                ocd.send("halt; wait_halt")
-                                output = ocd.send(f"{cmd} {addr}")
-                                ocd.send("resume")
+                                state = ocd.send("[target current] curstate")
+                                if "halted" in state:
+                                    self.after(0, self.app.disable_all_auto_poll)
+                                    output = ocd.send(f"{cmd} {addr}")
+                                else:
+                                    ocd.send("halt; wait_halt")
+                                    output = ocd.send(f"{cmd} {addr}")
+                                    ocd.send("resume")
 
-                        self.after(0, lambda: self.process_read(output))
-                except Exception:
-                    self.after(0, lambda: self.set_error("Comm Error"))
+                            if not self.app.abort_transfers:
+                                self.after(0, lambda: self.process_read(output))
+                    except Exception:
+                        if not self.app.abort_transfers:
+                            self.after(0, lambda: self.set_error("Comm Error"))
+            finally:
+                self._busy = False
+                if self.winfo_exists() and self.auto_poll.get() and not halted_only and not self.app.abort_transfers:
+                    self.after(interval, self.execute_read)
 
         threading.Thread(target=_read_task, daemon=True).start()
-
-        if self.auto_poll.get() and not halted_only:
-            self.after(interval, self.execute_read)
 
     def process_read(self, output):
         if not self.winfo_exists():
