@@ -28,6 +28,19 @@ class BaseWidget(ctk.CTkFrame):
         "BreakOnVarWidget": (900, 320),
     }
 
+    # Natural minimum content (width, height) below which scrollbars appear
+    MIN_CONTENT_SIZES = {
+        "AliveLightWidget": (530, 105),
+        "VarSlider": (590, 125),
+        "EnumSelectorWidget": (560, 155),
+        "MemFileLoader": (550, 130),
+        "ReadMonitor": (610, 115),
+        "MemBlockPlotter": (600, 340),
+        "BreakOnFuncWidget": (820, 260),
+        "BreakOnLineWidget": (820, 260),
+        "BreakOnVarWidget": (820, 260),
+    }
+
     def __init__(self, parent, **kwargs):
         cls_name = self.__class__.__name__
         def_w, def_h = self.DEFAULT_SIZES.get(cls_name, (580, 150))
@@ -35,13 +48,15 @@ class BaseWidget(ctk.CTkFrame):
         kwargs.setdefault("height", def_h)
         super().__init__(parent, **kwargs)
 
-        self._tile_w = kwargs["width"]
-        self._tile_h = kwargs["height"]
+        self._tile_w = int(kwargs["width"])
+        self._tile_h = int(kwargs["height"])
         self._tile_x = 20
         self._tile_y = 20
         self._tile_placed = False
         self._updating_scrollbars = False
         self._adopted_children = set()
+        self._last_win_size = (0, 0)
+        self._last_scroll_region = (0, 0, 0, 0)
 
         self._drag_start_x = 0
         self._drag_start_y = 0
@@ -51,6 +66,17 @@ class BaseWidget(ctk.CTkFrame):
         self._resize_start_h = self._tile_h
 
         self._build_scroll_viewport()
+
+    def _get_min_content_size(self):
+        """Returns the natural content (min_w, min_h) so scrollbars trigger reliably when shrunk."""
+        cls_name = self.__class__.__name__
+        min_w, min_h = self.MIN_CONTENT_SIZES.get(cls_name, (550, 130))
+        if cls_name == "ReadMonitor":
+            if hasattr(self, "show_bitfields") and self.show_bitfields.get():
+                min_h += 140
+            if hasattr(self, "show_plot") and self.show_plot.get():
+                min_h += 230
+        return min_w, min_h
 
     def _build_scroll_viewport(self):
         """Creates a viewport with auto-appearing horizontal & vertical sliding bars."""
@@ -84,25 +110,17 @@ class BaseWidget(ctk.CTkFrame):
             yscrollcommand=self._v_scroll.set,
         )
 
-        # Pack scrollbars first so _vp_canvas claims exact remaining space when shown
-        self._v_scroll.pack(side="right", fill="y")
-        self._h_scroll.pack(side="bottom", fill="x")
         self._vp_canvas.pack(side="left", fill="both", expand=True)
-
-        self._v_scroll.pack_forget()
-        self._h_scroll.pack_forget()
 
         self._inner_frame = tk.Frame(self._vp_canvas, bg=bg_col, highlightthickness=0, bd=0)
         self._vp_win_id = self._vp_canvas.create_window((0, 0), window=self._inner_frame, anchor="nw")
 
-        self._inner_frame.bind("<Configure>", self._on_inner_configure)
-        self._vp_canvas.bind("<Configure>", self._on_canvas_configure)
+        self._vp_container.bind("<Configure>", self._on_viewport_configure)
 
-        # Vertical mouse-wheel scrolling inside the widget viewport
         for target in (self._vp_canvas, self._inner_frame):
             target.bind("<MouseWheel>", self._on_tile_mousewheel)
 
-        # Right-click context menu fallback to delete a widget even if 'X' is scrolled off-screen
+        # Right-click context menu fallback to delete a widget at any time
         self._ctx_menu = tk.Menu(self, tearoff=0)
         self._ctx_menu.add_command(label="Delete Widget", command=self.destroy)
         for target in (self, self._vp_canvas, self._inner_frame):
@@ -144,54 +162,31 @@ class BaseWidget(ctk.CTkFrame):
                 moved_any = True
 
         if moved_any:
-            self.after(20, self._on_inner_configure)
-            self.after(30, self._lift_handles)
+            self._on_viewport_configure()
+            self._lift_handles()
 
-    def _on_inner_configure(self, event=None):
-        if not self.winfo_exists():
-            return
-        self.update_idletasks()
-        req_w = self._inner_frame.winfo_reqwidth()
-        req_h = self._inner_frame.winfo_reqheight()
-        vis_w = max(1, self._vp_canvas.winfo_width())
-        vis_h = max(1, self._vp_canvas.winfo_height())
-
-        target_w = max(req_w, vis_w)
-        target_h = max(req_h, vis_h)
-        self._vp_canvas.itemconfigure(self._vp_win_id, width=target_w, height=target_h)
-        self._vp_canvas.configure(scrollregion=(0, 0, target_w, target_h))
-        self._sync_scrollbars()
-
-    def _on_canvas_configure(self, event=None):
-        if not self.winfo_exists():
-            return
-        self._adopt_children_into_viewport()
-        req_w = self._inner_frame.winfo_reqwidth()
-        req_h = self._inner_frame.winfo_reqheight()
-        vis_w = max(1, self._vp_canvas.winfo_width())
-        vis_h = max(1, self._vp_canvas.winfo_height())
-
-        target_w = max(req_w, vis_w)
-        target_h = max(req_h, vis_h)
-        self._vp_canvas.itemconfigure(self._vp_win_id, width=target_w, height=target_h)
-        self._vp_canvas.configure(scrollregion=(0, 0, target_w, target_h))
-        self._sync_scrollbars()
-
-    def _sync_scrollbars(self):
+    def _on_viewport_configure(self, event=None):
+        """Updates inner frame size and scrollbar visibility without feedback loops."""
         if self._updating_scrollbars or not self.winfo_exists():
             return
         self._updating_scrollbars = True
         try:
-            req_w = self._inner_frame.winfo_reqwidth()
-            req_h = self._inner_frame.winfo_reqheight()
-            vis_w = self._vp_canvas.winfo_width()
-            vis_h = self._vp_canvas.winfo_height()
-
-            if vis_w <= 1 or vis_h <= 1:
+            cont_w = self._vp_container.winfo_width()
+            cont_h = self._vp_container.winfo_height()
+            if cont_w <= 10 or cont_h <= 10:
                 return
 
-            need_h = req_w > (vis_w + 2)
-            need_v = req_h > (vis_h + 2)
+            min_w, min_h = self._get_min_content_size()
+
+            # Compute scrollbar requirements from outer container dimensions (immune to thrashing)
+            need_h = min_w > cont_w
+            need_v = min_h > cont_h
+            avail_w = cont_w - (12 if need_v else 0)
+            avail_h = cont_h - (12 if need_h else 0)
+            need_h = min_w > avail_w
+            need_v = min_h > avail_h
+            avail_w = max(1, cont_w - (12 if need_v else 0))
+            avail_h = max(1, cont_h - (12 if need_h else 0))
 
             if need_h and not self._h_scroll.winfo_manager():
                 self._h_scroll.pack(side="bottom", fill="x", before=self._vp_canvas)
@@ -204,6 +199,18 @@ class BaseWidget(ctk.CTkFrame):
             elif not need_v and self._v_scroll.winfo_manager():
                 self._v_scroll.pack_forget()
                 self._vp_canvas.yview_moveto(0.0)
+
+            target_w = max(min_w, avail_w)
+            target_h = max(min_h, avail_h)
+
+            if (target_w, target_h) != self._last_win_size:
+                self._last_win_size = (target_w, target_h)
+                self._vp_canvas.itemconfigure(self._vp_win_id, width=target_w, height=target_h)
+
+            sr = (0, 0, target_w, target_h)
+            if sr != self._last_scroll_region:
+                self._last_scroll_region = sr
+                self._vp_canvas.configure(scrollregion=sr)
         finally:
             self._updating_scrollbars = False
 
@@ -274,7 +281,6 @@ class BaseWidget(ctk.CTkFrame):
         if self.winfo_exists():
             self.drag_handle.lift()
             self.resize_grip.lift()
-            self._sync_scrollbars()
 
     def _on_drag_start(self, event):
         self.lift()
@@ -301,22 +307,24 @@ class BaseWidget(ctk.CTkFrame):
     def _on_resize_motion(self, event):
         dx = event.x_root - self._resize_start_x
         dy = event.y_root - self._resize_start_y
-        new_w = max(220, round((self._resize_start_w + dx) / self.GRID_SNAP) * self.GRID_SNAP)
-        new_h = max(90, round((self._resize_start_h + dy) / self.GRID_SNAP) * self.GRID_SNAP)
+        new_w = max(200, round((self._resize_start_w + dx) / self.GRID_SNAP) * self.GRID_SNAP)
+        new_h = max(80, round((self._resize_start_h + dy) / self.GRID_SNAP) * self.GRID_SNAP)
         if new_w != self._tile_w or new_h != self._tile_h:
-            self._tile_w = new_w
-            self._tile_h = new_h
+            self._tile_w = int(new_w)
+            self._tile_h = int(new_h)
             self.configure(width=self._tile_w, height=self._tile_h)
             self._lift_handles()
+            self._on_viewport_configure()
             self._update_canvas_height()
 
     def set_tile_size(self, w=None, h=None):
         if w is not None:
-            self._tile_w = w
+            self._tile_w = int(w)
         if h is not None:
-            self._tile_h = h
+            self._tile_h = int(h)
         self.configure(width=self._tile_w, height=self._tile_h)
         self._lift_handles()
+        self._on_viewport_configure()
         self._update_canvas_height()
 
     def _update_canvas_height(self):
@@ -333,19 +341,25 @@ class BaseWidget(ctk.CTkFrame):
             pass
 
     def get_geometry_state(self):
-        return {"x": self._tile_x, "y": self._tile_y, "w": self._tile_w, "h": self._tile_h}
+        return {
+            "x": int(self._tile_x),
+            "y": int(self._tile_y),
+            "w": int(self._tile_w),
+            "h": int(self._tile_h),
+        }
 
     def set_geometry_state(self, state):
         if "x" in state and "y" in state:
-            self._tile_x = state["x"]
-            self._tile_y = state["y"]
+            self._tile_x = int(state["x"])
+            self._tile_y = int(state["y"])
             self.place(x=self._tile_x, y=self._tile_y)
         if "w" in state and "h" in state:
-            self._tile_w = state["w"]
-            self._tile_h = state["h"]
+            self._tile_w = int(state["w"])
+            self._tile_h = int(state["h"])
             self.configure(width=self._tile_w, height=self._tile_h)
         self._lift_handles()
         self._update_canvas_height()
+        self.after(20, self._on_viewport_configure)
 
     def get_resolved_addr(self, addr_str):
         addr_str = addr_str.strip()
@@ -410,6 +424,9 @@ class VarSlider(BaseWidget):
         try:
             min_v = int(self.min_val.get())
             max_v = int(self.max_val.get())
+            if min_v >= max_v:
+                max_v = min_v + 1
+                self.max_val.set(str(max_v))
             self.slider.configure(from_=min_v, to=max_v)
             self.current_val_label.configure(text=f"Target Value: {int(self.slider.get())}")
         except ValueError:
@@ -469,6 +486,7 @@ class VarSlider(BaseWidget):
             "var_type": self.var_type.get(),
             "min_val": self.min_val.get(),
             "max_val": self.max_val.get(),
+            "slider_val": int(self.slider.get()),
         }
 
     def set_state(self, state):
@@ -477,6 +495,13 @@ class VarSlider(BaseWidget):
         self.min_val.set(state.get("min_val", "0"))
         self.max_val.set(state.get("max_val", "255"))
         self.update_config()
+        if "slider_val" in state:
+            try:
+                s_val = int(state["slider_val"])
+                self.slider.set(s_val)
+                self.current_val_label.configure(text=f"Target Value: {s_val}")
+            except (ValueError, TypeError):
+                pass
 
 
 class EnumSelectorWidget(BaseWidget):
@@ -560,7 +585,7 @@ class EnumSelectorWidget(BaseWidget):
             command=self.on_choice_selected,
         )
         self.segmented_btn.pack(fill="x", padx=10, pady=8)
-        self.after(20, self._on_inner_configure)
+        self.after(20, self._on_viewport_configure)
 
     def on_choice_selected(self, label):
         if not self.winfo_exists():
@@ -741,9 +766,9 @@ class ReadMonitor(BaseWidget):
 
         ctk.CTkButton(plot_ctrl_frame, text="Clear", width=60, fg_color="#555555", command=self.clear_plot).pack(side="right")
 
-        self.fig = Figure(figsize=(8, 2.2), dpi=100)
+        self.fig = Figure(figsize=(5.5, 2.0), dpi=100)
         self.fig.patch.set_facecolor("#242424")
-        self.fig.subplots_adjust(left=0.08, right=0.98, top=0.9, bottom=0.2)
+        self.fig.subplots_adjust(left=0.09, right=0.98, top=0.9, bottom=0.2)
 
         self.ax = self.fig.add_subplot(111)
         self.ax.set_facecolor("#1E1E1E")
@@ -756,6 +781,24 @@ class ReadMonitor(BaseWidget):
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
+    def _apply_optional_panes(self):
+        """Packs or unpacks the bitfield and plot frames inside _inner_frame without resetting custom tile sizes."""
+        self._adopt_children_into_viewport()
+        if self.show_bitfields.get():
+            self.bf_frame.pack(fill="x", padx=15, pady=(0, 10), in_=self._inner_frame)
+            self._adopted_children.add(self.bf_frame)
+        else:
+            self.bf_frame.pack_forget()
+
+        if self.show_plot.get():
+            self.plot_frame.pack(fill="both", expand=True, padx=15, pady=(0, 12), in_=self._inner_frame)
+            self._adopted_children.add(self.plot_frame)
+            self.update_plot_visuals()
+        else:
+            self.plot_frame.pack_forget()
+
+        self._on_viewport_configure()
+
     def _recalc_read_tile_height(self):
         h = 145
         if self.show_bitfields.get():
@@ -763,22 +806,15 @@ class ReadMonitor(BaseWidget):
         if self.show_plot.get():
             h += 245
         self.set_tile_size(h=h)
-        self.after(20, self._on_inner_configure)
 
     def toggle_bitfields(self):
-        if self.show_bitfields.get():
-            self.bf_frame.pack(fill="x", padx=15, pady=(0, 10), in_=self._inner_frame)
-            self.execute_read()
-        else:
-            self.bf_frame.pack_forget()
+        self._apply_optional_panes()
         self._recalc_read_tile_height()
+        if self.show_bitfields.get():
+            self.execute_read()
 
     def toggle_plot(self):
-        if self.show_plot.get():
-            self.plot_frame.pack(fill="x", padx=15, pady=(0, 12), in_=self._inner_frame)
-            self.update_plot_visuals()
-        else:
-            self.plot_frame.pack_forget()
+        self._apply_optional_panes()
         self._recalc_read_tile_height()
 
     def clear_plot(self):
@@ -979,11 +1015,11 @@ class ReadMonitor(BaseWidget):
         self.frac_bits.set(state.get("frac_bits", "0"))
         self.poll_interval.set(state.get("poll_interval", "500"))
 
-        self.show_bitfields.set(state.get("show_bitfields", False))
-        self.show_plot.set(state.get("show_plot", False))
+        self.show_bitfields.set(bool(state.get("show_bitfields", False)))
+        self.show_plot.set(bool(state.get("show_plot", False)))
         self.plot_buffer_size.set(state.get("plot_buffer_size", "100"))
 
-        self.auto_scale.set(state.get("auto_scale", True))
+        self.auto_scale.set(bool(state.get("auto_scale", True)))
         self.y_min.set(state.get("y_min", "-10"))
         self.y_max.set(state.get("y_max", "100"))
 
@@ -993,10 +1029,11 @@ class ReadMonitor(BaseWidget):
                 self.bitfield_rows[i]["name"].set(bf_state.get("name", ""))
                 self.bitfield_rows[i]["range"].set(bf_state.get("range", ""))
 
-        if self.show_bitfields.get():
-            self.toggle_bitfields()
-        if self.show_plot.get():
-            self.toggle_plot()
+        # Apply pane visibility without overwriting custom saved tile height (w, h)
+        self._apply_optional_panes()
+        if "h" not in state and (self.show_bitfields.get() or self.show_plot.get()):
+            self._recalc_read_tile_height()
+
         if state.get("auto_poll", False):
             self.auto_poll.set(True)
             self.toggle_poll()
@@ -1044,9 +1081,9 @@ class MemBlockPlotter(BaseWidget):
         ctk.CTkLabel(action_frame, text="ms").pack(side="right", padx=(0, 5))
         ctk.CTkSwitch(action_frame, text="Auto", variable=self.auto_poll, command=self.toggle_poll).pack(side="right", padx=(10, 5))
 
-        self.fig = Figure(figsize=(8, 3.0), dpi=100)
+        self.fig = Figure(figsize=(5.5, 2.6), dpi=100)
         self.fig.patch.set_facecolor("#242424")
-        self.fig.subplots_adjust(left=0.08, right=0.98, top=0.9, bottom=0.15)
+        self.fig.subplots_adjust(left=0.09, right=0.98, top=0.9, bottom=0.15)
         self.ax = self.fig.add_subplot(111)
         self.setup_axes()
 

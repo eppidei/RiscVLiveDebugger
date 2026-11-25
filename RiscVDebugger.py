@@ -2,6 +2,7 @@
 import json
 import os
 import threading
+import traceback
 import customtkinter as ctk
 from tkinter import filedialog
 
@@ -16,6 +17,7 @@ from ocd_backend import (
     parse_lst_file,
 )
 from widgets_telemetry import (
+    BaseWidget,
     VarSlider,
     EnumSelectorWidget,
     ReadMonitor,
@@ -36,8 +38,8 @@ ctk.set_default_color_theme("blue")
 class ModernOpenOCD_GUI(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("RiscV Live Tuner & Telemetry Dashboard")
-        self.geometry("1150x860")
+        self.title("RISC-V Live Tuner & Telemetry Dashboard")
+        self.geometry("1180x880")
 
         self.symbol_table = {}
         self.var_symbols = {}
@@ -98,65 +100,58 @@ class ModernOpenOCD_GUI(ctk.CTk):
         add_frame.pack(fill="x", padx=20, pady=(2, 10))
 
         ctk.CTkButton(
-            add_frame, text="+ Read Var", width=95, fg_color="#0277BD", hover_color="#01579B",
+            add_frame, text="+ Read Var", width=90, fg_color="#0277BD", hover_color="#01579B",
             command=lambda: ReadMonitor(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 8))
+        ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
-            add_frame, text="+ Write Slider", width=100, fg_color="#2E7D32", hover_color="#1B5E20",
+            add_frame, text="+ Write Slider", width=95, fg_color="#2E7D32", hover_color="#1B5E20",
             command=lambda: VarSlider(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 8))
+        ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
-            add_frame, text="+ Enum Switch", width=110, fg_color="#3F51B5", hover_color="#303F9F",
+            add_frame, text="+ Enum Switch", width=105, fg_color="#3F51B5", hover_color="#303F9F",
             command=lambda: EnumSelectorWidget(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 8))
+        ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
-            add_frame, text="+ Mem Plotter", width=100, fg_color="#8E24AA", hover_color="#6A1B9A",
+            add_frame, text="+ Mem Plotter", width=95, fg_color="#8E24AA", hover_color="#6A1B9A",
             command=lambda: MemBlockPlotter(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 8))
+        ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
-            add_frame, text="+ Mem Loader", width=100, fg_color="#F57C00", hover_color="#E65100",
+            add_frame, text="+ Mem Loader", width=95, fg_color="#F57C00", hover_color="#E65100",
             command=lambda: MemFileLoader(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 8))
+        ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
-            add_frame, text="+ Alive Light", width=95, fg_color="#FBC02D", hover_color="#F9A825", text_color="black",
+            add_frame, text="+ Alive Light", width=90, fg_color="#FBC02D", hover_color="#F9A825", text_color="black",
             command=lambda: AliveLightWidget(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 16))
+        ).pack(side="left", padx=(0, 12))
 
         ctk.CTkButton(
-            add_frame, text="+ Break on Func", width=115, fg_color="#00838F", hover_color="#006064",
+            add_frame, text="+ Break on Func", width=110, fg_color="#00838F", hover_color="#006064",
             command=lambda: BreakOnFuncWidget(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 8))
+        ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
-            add_frame, text="+ Break on Line", width=115, fg_color="#00695C", hover_color="#004D40",
+            add_frame, text="+ Break on Line", width=110, fg_color="#00695C", hover_color="#004D40",
             command=lambda: BreakOnLineWidget(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 8))
+        ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
-            add_frame, text="+ Break on Var", width=115, fg_color="#D84315", hover_color="#BF360C",
+            add_frame, text="+ Break on Var", width=110, fg_color="#D84315", hover_color="#BF360C",
             command=lambda: BreakOnVarWidget(self.scrollable_frame, self),
         ).pack(side="left")
 
         self.scrollable_frame = ctk.CTkScrollableFrame(self, corner_radius=10)
         self.scrollable_frame.pack(side="top", fill="both", expand=True, padx=20, pady=5)
 
-        # Create a 2000px-tall 2D canvas surface inside the scrollable frame for free-form placement
-        self.workspace = ctk.CTkFrame(self.scrollable_frame, height=2000, fg_color="transparent")
-        self.workspace.pack(fill="x", expand=True)
-        
         self.log_text = ctk.CTkTextbox(self, height=100, state="disabled", font=("Consolas", 12))
         self.log_text.pack(pady=(15, 5), padx=20, fill="x")
 
-
-
-
         footer_frame = ctk.CTkFrame(self, fg_color="transparent")
         footer_frame.pack(fill="x", padx=20, pady=(0, 10))
-        
+
         author_lbl = ctk.CTkLabel(
-            footer_frame, 
-            text="RISCV Live Tuner & Telemetry Dashboard  |  Developed by Leonardo Di Carlo", 
-            font=("Consolas", 11), 
+            footer_frame,
+            text="RISC-V Live Tuner & Telemetry Dashboard  |  Developed by Leonardo Di Carlo",
+            font=("Consolas", 11),
             text_color="#777777",
-            anchor="w"
+            anchor="w",
         )
         author_lbl.pack(side="left")
 
@@ -221,14 +216,12 @@ class ModernOpenOCD_GUI(ctk.CTk):
             except Exception as e:
                 self.log_msg(f"Failed to start OpenOCD: {e}")
         else:
-            # 1. Immediately halt all GUI timers and tell queued threads to abort
             self.stop_all_activity()
-            # 2. Terminate the OpenOCD process
             stop_openocd_console(self.ocd_process)
             self.ocd_process = None
             self.btn_start_ocd.configure(text="Start OpenOCD", fg_color="#00695C", hover_color="#004D40")
             self.log_msg("OpenOCD server stopped. All polling and queued reads flushed.")
-            
+
     def reset_target(self):
         def _task():
             with self.jtag_lock:
@@ -243,12 +236,13 @@ class ModernOpenOCD_GUI(ctk.CTk):
         threading.Thread(target=_task, daemon=True).start()
 
     def on_closing(self):
+        self.stop_all_activity()
         stop_openocd_console(self.ocd_process)
         self.ocd_process = None
         self.destroy()
 
     def load_map_file(self):
-        filepath = filedialog.askopenfilename(filetypes=[("Map Files", "*.map"), ("All Files", "*.*")])
+        filepath = filedialog.askopenfilename(title="Select .map File", filetypes=[("Map Files", "*.map"), ("All Files", "*.*")])
         if not filepath:
             return
         try:
@@ -270,7 +264,7 @@ class ModernOpenOCD_GUI(ctk.CTk):
             self.log_msg(f"ERROR reading map file: {e}")
 
     def load_lst_file(self):
-        filepath = filedialog.askopenfilename(filetypes=[("Disassembly Listing", "*.lst *.txt"), ("All Files", "*.*")])
+        filepath = filedialog.askopenfilename(title="Select .lst File", filetypes=[("Disassembly Listing", "*.lst *.txt"), ("All Files", "*.*")])
         if not filepath:
             return
         try:
@@ -283,27 +277,31 @@ class ModernOpenOCD_GUI(ctk.CTk):
             self.log_msg(f"ERROR reading .lst file: {e}")
 
     def save_layout(self):
-        filepath = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Layouts", "*.json")])
+        filepath = filedialog.asksaveasfilename(
+            title="Save Dashboard Layout",
+            defaultextension=".json",
+            filetypes=[("JSON Layouts", "*.json"), ("All Files", "*.*")],
+        )
         if not filepath:
             return
         layout_data = []
-        for w in self.workspace.winfo_children():
-            if hasattr(w, "get_state"):
-                st = w.get_state()
-                st.update(w.get_geometry_state())  # Saves x, y, w, h!
+        for w in self.scrollable_frame.winfo_children():
+            if isinstance(w, BaseWidget) and hasattr(w, "get_state"):
+                st = dict(w.get_state())
+                st.update(w.get_geometry_state())
                 layout_data.append(st)
         try:
-            with open(filepath, "w") as f:
+            with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(layout_data, f, indent=4)
-            self.log_msg(f"Layout saved successfully: {len(layout_data)} widgets.")
+            self.log_msg(f"Layout saved successfully ({len(layout_data)} widgets) -> {os.path.basename(filepath)}")
         except Exception as e:
             self.log_msg(f"ERROR saving layout: {e}")
 
     def load_layout(self):
-        new_w = cls(self.workspace, self)
-        new_w.set_state(state)
-        new_w.set_geometry_state(state)
-        filepath = filedialog.askopenfilename(filetypes=[("JSON Layouts", "*.json"), ("All Files", "*.*")])
+        filepath = filedialog.askopenfilename(
+            title="Load Dashboard Layout",
+            filetypes=[("JSON Layouts", "*.json"), ("All Files", "*.*")],
+        )
         if not filepath:
             return
         widget_factory = {
@@ -318,18 +316,34 @@ class ModernOpenOCD_GUI(ctk.CTk):
             "bp_var": BreakOnVarWidget,
         }
         try:
-            with open(filepath, "r") as f:
+            with open(filepath, "r", encoding="utf-8") as f:
                 layout_data = json.load(f)
-            for widget in self.scrollable_frame.winfo_children():
+
+            self.stop_all_activity()
+            self.abort_transfers = False
+
+            for widget in list(self.scrollable_frame.winfo_children()):
                 widget.destroy()
+            if hasattr(self.scrollable_frame, "_tile_spacer"):
+                self.scrollable_frame._tile_spacer = None
+
+            loaded_count = 0
             for state in layout_data:
-                cls = widget_factory.get(state.get("widget_type"))
+                w_type = state.get("widget_type")
+                cls = widget_factory.get(w_type)
                 if cls:
                     new_w = cls(self.scrollable_frame, self)
+                    new_w._adopt_children_into_viewport()
                     new_w.set_state(state)
-            self.log_msg(f"Layout loaded successfully: {len(layout_data)} widgets.")
+                    # Restore exact (x, y, w, h) AFTER set_state so saved sizes are never overwritten
+                    new_w.set_geometry_state(state)
+                    loaded_count += 1
+                else:
+                    self.log_msg(f"Warning: Unknown widget_type '{w_type}' skipped.")
+
+            self.log_msg(f"Layout loaded successfully ({loaded_count} widgets) <- {os.path.basename(filepath)}")
         except Exception as e:
-            self.log_msg(f"ERROR loading layout: {e}")
+            self.log_msg(f"ERROR loading layout: {e}\n{traceback.format_exc()}")
 
     def log_msg(self, msg):
         self.log_text.configure(state="normal")
