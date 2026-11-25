@@ -31,6 +31,8 @@ from widgets_breakpoints import (
     BreakOnVarWidget,
 )
 
+from widgets_roi import RoiCropWidget
+
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
@@ -100,40 +102,44 @@ class ModernOpenOCD_GUI(ctk.CTk):
         add_frame.pack(fill="x", padx=20, pady=(2, 10))
 
         ctk.CTkButton(
-            add_frame, text="+ Read Var", width=90, fg_color="#0277BD", hover_color="#01579B",
+            add_frame, text="+ Read Var", width=85, fg_color="#0277BD", hover_color="#01579B",
             command=lambda: ReadMonitor(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 6))
+        ).pack(side="left", padx=(0, 5))
         ctk.CTkButton(
-            add_frame, text="+ Write Slider", width=95, fg_color="#2E7D32", hover_color="#1B5E20",
+            add_frame, text="+ Write Slider", width=92, fg_color="#2E7D32", hover_color="#1B5E20",
             command=lambda: VarSlider(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 6))
+        ).pack(side="left", padx=(0, 5))
         ctk.CTkButton(
-            add_frame, text="+ Enum Switch", width=105, fg_color="#3F51B5", hover_color="#303F9F",
+            add_frame, text="+ Enum Switch", width=98, fg_color="#3F51B5", hover_color="#303F9F",
             command=lambda: EnumSelectorWidget(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 6))
+        ).pack(side="left", padx=(0, 5))
         ctk.CTkButton(
-            add_frame, text="+ Mem Plotter", width=95, fg_color="#8E24AA", hover_color="#6A1B9A",
+            add_frame, text="+ ROI Cropper", width=98, fg_color="#00ACC1", hover_color="#00838F", text_color="black",
+            command=lambda: RoiCropWidget(self.scrollable_frame, self),
+        ).pack(side="left", padx=(0, 5))
+        ctk.CTkButton(
+            add_frame, text="+ Mem Plotter", width=92, fg_color="#8E24AA", hover_color="#6A1B9A",
             command=lambda: MemBlockPlotter(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 6))
+        ).pack(side="left", padx=(0, 5))
         ctk.CTkButton(
-            add_frame, text="+ Mem Loader", width=95, fg_color="#F57C00", hover_color="#E65100",
+            add_frame, text="+ Mem Loader", width=92, fg_color="#F57C00", hover_color="#E65100",
             command=lambda: MemFileLoader(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 6))
+        ).pack(side="left", padx=(0, 5))
         ctk.CTkButton(
-            add_frame, text="+ Alive Light", width=90, fg_color="#FBC02D", hover_color="#F9A825", text_color="black",
+            add_frame, text="+ Alive Light", width=86, fg_color="#FBC02D", hover_color="#F9A825", text_color="black",
             command=lambda: AliveLightWidget(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 12))
+        ).pack(side="left", padx=(0, 10))
 
         ctk.CTkButton(
-            add_frame, text="+ Break on Func", width=110, fg_color="#00838F", hover_color="#006064",
+            add_frame, text="+ Break on Func", width=105, fg_color="#00838F", hover_color="#006064",
             command=lambda: BreakOnFuncWidget(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 6))
+        ).pack(side="left", padx=(0, 5))
         ctk.CTkButton(
-            add_frame, text="+ Break on Line", width=110, fg_color="#00695C", hover_color="#004D40",
+            add_frame, text="+ Break on Line", width=105, fg_color="#00695C", hover_color="#004D40",
             command=lambda: BreakOnLineWidget(self.scrollable_frame, self),
-        ).pack(side="left", padx=(0, 6))
+        ).pack(side="left", padx=(0, 5))
         ctk.CTkButton(
-            add_frame, text="+ Break on Var", width=110, fg_color="#D84315", hover_color="#BF360C",
+            add_frame, text="+ Break on Var", width=102, fg_color="#D84315", hover_color="#BF360C",
             command=lambda: BreakOnVarWidget(self.scrollable_frame, self),
         ).pack(side="left")
 
@@ -307,6 +313,7 @@ class ModernOpenOCD_GUI(ctk.CTk):
         widget_factory = {
             "write": VarSlider,
             "enum_selector": EnumSelectorWidget,
+            "roi_crop": RoiCropWidget,
             "read": ReadMonitor,
             "plotter": MemBlockPlotter,
             "loader": MemFileLoader,
