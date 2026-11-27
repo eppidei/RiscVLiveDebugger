@@ -7,7 +7,7 @@ import tkinter as tk
 import customtkinter as ctk
 
 from ocd_backend import OpenOCDSession
-from widgets_telemetry import BaseWidget
+from widgets_telemetry import BaseWidget, decode_ocd_word
 
 
 _ALLOWED_BINOPS = {
@@ -25,7 +25,7 @@ _ALLOWED_UNARYOPS = {
 }
 
 
-def eval_roi_formula(expr_str: str, sym_vars: dict) -> float:
+def eval_roi_formula(expr_str: str, sym_vars: dict, relax_floor_div: bool = False) -> float:
     """Safely evaluates linear combinations and arithmetic formulas of ROI vertex coordinates."""
     cleaned = expr_str.strip()
     if not cleaned:
@@ -45,7 +45,8 @@ def eval_roi_formula(expr_str: str, sym_vars: dict) -> float:
                 return norm_vars[key]
             raise ValueError(f"Unknown token '{node.id}'")
         if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
-            return _ALLOWED_BINOPS[type(node.op)](_eval(node.left), _eval(node.right))
+            op_fn = operator.truediv if (relax_floor_div and isinstance(node.op, ast.FloorDiv)) else _ALLOWED_BINOPS[type(node.op)]
+            return op_fn(_eval(node.left), _eval(node.right))
         if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
             return _ALLOWED_UNARYOPS[type(node.op)](_eval(node.operand))
         raise ValueError("Unsupported operator")
@@ -687,6 +688,187 @@ class RoiCropWidget(BaseWidget):
                     self._write_pending = False
 
         threading.Thread(target=_write_task, daemon=True).start()
+
+    # --- TARGET RAM SYNC & 4x4 INVERSE LINEAR SOLVER ---
+    def _extract_linear_coeffs(self, expr: str):
+        """Extracts [a_x0, a_y0, a_x1, a_y1], const_offset, uses_frame_dims for a linear ROI formula."""
+        def _eval_pt(px0, py0, px1, py1, pfw=self.fw, pfh=self.fh):
+            vd = {
+                "UL_X": px0, "UL_Y": py0,
+                "UR_X": px1, "UR_Y": py0,
+                "LL_X": px0, "LL_Y": py1,
+                "LR_X": px1, "LR_Y": py1,
+                "FW": pfw, "FH": pfh,
+            }
+            return eval_roi_formula(expr, vd, relax_floor_div=True)
+
+        c = _eval_pt(0.0, 0.0, 0.0, 0.0)
+        a0 = _eval_pt(1.0, 0.0, 0.0, 0.0) - c
+        a1 = _eval_pt(0.0, 1.0, 0.0, 0.0) - c
+        a2 = _eval_pt(0.0, 0.0, 1.0, 0.0) - c
+        a3 = _eval_pt(0.0, 0.0, 0.0, 1.0) - c
+
+        # Verify linearity at an arbitrary test point
+        test_lin = a0 * 7.0 + a1 * 13.0 + a2 * 29.0 + a3 * 41.0 + c
+        test_act = _eval_pt(7.0, 13.0, 29.0, 41.0)
+        if abs(test_lin - test_act) > 1e-5:
+            raise ValueError("Non-linear ROI formula")
+
+        uses_frame = abs(_eval_pt(0.0, 0.0, 0.0, 0.0, self.fw + 10, self.fh + 10) - c) > 1e-6
+        return [a0, a1, a2, a3], c, uses_frame
+
+    @staticmethod
+    def _matrix_rank(rows):
+        M = [r[:] for r in rows]
+        rank = 0
+        num_rows = len(M)
+        for col in range(4):
+            piv = next((r for r in range(rank, num_rows) if abs(M[r][col]) > 1e-9), None)
+            if piv is None:
+                continue
+            M[rank], M[piv] = M[piv], M[rank]
+            pval = M[rank][col]
+            for r in range(rank + 1, num_rows):
+                fac = M[r][col] / pval
+                for c in range(col, 4):
+                    M[r][c] -= fac * M[rank][c]
+            rank += 1
+        return rank
+
+    @staticmethod
+    def _solve_4x4(mat, rhs):
+        M = [mat[i][:] + [rhs[i]] for i in range(4)]
+        for col in range(4):
+            piv = max(range(col, 4), key=lambda r: abs(M[r][col]))
+            if abs(M[piv][col]) < 1e-9:
+                return None
+            M[col], M[piv] = M[piv], M[col]
+            pval = M[col][col]
+            for r in range(col + 1, 4):
+                fac = M[r][col] / pval
+                for c in range(col, 5):
+                    M[r][c] -= fac * M[col][c]
+        sol = [0.0] * 4
+        for r in range(3, -1, -1):
+            sol[r] = (M[r][4] - sum(M[r][c] * sol[c] for c in range(r + 1, 4))) / M[r][r]
+        return sol
+
+    def get_sync_requests(self):
+        reqs = []
+        for row in self.mapping_rows:
+            if not row["enabled"].get():
+                continue
+            name = row["var_name"].get().strip()
+            if not name:
+                continue
+            addr = self.get_resolved_addr(name)
+            if not addr:
+                self.app.log_msg(f"ROI Sync Skip: '{name}' is not a valid map symbol or hex address.")
+                continue
+            v_type = row["var_type"].get()
+            mem_cmd = "mdw" if v_type == "float" else ("mdb" if "8" in v_type else ("mdh" if "16" in v_type else "mdw"))
+            reqs.append((addr, mem_cmd))
+        return reqs
+
+    def apply_sync_results(self, raw_map: dict):
+        if not self.winfo_exists():
+            return
+        if self._debounce_timer is not None:
+            self.after_cancel(self._debounce_timer)
+            self._debounce_timer = None
+
+        read_rows = []
+        eq_mat = []
+        eq_rhs = []
+        any_uses_frame = False
+        solvable = True
+
+        for row in self.mapping_rows:
+            if not row["enabled"].get():
+                continue
+            name = row["var_name"].get().strip()
+            if not name:
+                continue
+            addr = self.get_resolved_addr(name)
+            if not addr:
+                continue
+            v_type = row["var_type"].get()
+            mem_cmd = "mdw" if v_type == "float" else ("mdb" if "8" in v_type else ("mdh" if "16" in v_type else "mdw"))
+            raw_u32 = raw_map.get((addr, mem_cmd))
+            if raw_u32 is None:
+                continue
+
+            target_val = decode_ocd_word(raw_u32, v_type)
+            read_rows.append((row, name, v_type, target_val))
+
+            try:
+                coeffs, c_off, uses_fr = self._extract_linear_coeffs(row["formula"].get())
+                any_uses_frame = any_uses_frame or uses_fr
+                if len(eq_mat) < 4 and self._matrix_rank(eq_mat + [coeffs]) > len(eq_mat):
+                    eq_mat.append(coeffs)
+                    eq_rhs.append(float(target_val) - c_off)
+                else:
+                    solvable = False
+            except Exception:
+                solvable = False
+
+        if not read_rows:
+            return
+
+        # Complete any unconstrained degrees of freedom (e.g. 2-var X-only crop) using current coordinates
+        curr_u = [float(self.x0), float(self.y0), float(self.x1), float(self.y1)]
+        if solvable and len(eq_mat) < 4:
+            for j in range(4):
+                unit = [1.0 if k == j else 0.0 for k in range(4)]
+                if self._matrix_rank(eq_mat + [unit]) > len(eq_mat):
+                    eq_mat.append(unit)
+                    eq_rhs.append(curr_u[j])
+                if len(eq_mat) == 4:
+                    break
+
+        sol = self._solve_4x4(eq_mat, eq_rhs) if (solvable and len(eq_mat) == 4) else None
+
+        if sol is not None:
+            nx0, ny0, nx1, ny1 = [int(round(v)) for v in sol]
+
+            # Auto-expand virtual frame if target holds a valid larger ROI and formulas don't depend on FW/FH
+            if not any_uses_frame and 0 <= nx0 <= nx1 < 65536 and 0 <= ny0 <= ny1 < 65536:
+                if nx1 >= self.fw or ny1 >= self.fh:
+                    self.fw = max(self.fw, nx1 + 1)
+                    self.fh = max(self.fh, ny1 + 1)
+                    self.frame_w_var.set(str(self.fw))
+                    self.frame_h_var.set(str(self.fh))
+                    self.app.log_msg(f"ROI Sync Note: Expanded virtual frame to {self.fw}x{self.fh} to fit target ROI.")
+
+            clamped = (
+                nx0 < 0 or ny0 < 0 or nx1 >= self.fw or ny1 >= self.fh or nx0 > nx1 or ny0 > ny1
+            )
+            self.x0 = max(0, min(self.fw - 1, nx0))
+            self.x1 = max(self.x0, min(self.fw - 1, nx1))
+            self.y0 = max(0, min(self.fh - 1, ny0))
+            self.y1 = max(self.y0, min(self.fh - 1, ny1))
+
+            self._sync_coord_entries()
+            self._redraw_canvas()
+            self._evaluate_all_rows()
+
+            if clamped:
+                self.app.log_msg(
+                    "ROI Sync Warning: Target RAM registers mapped outside valid ROI bounds (e.g. zero/uninitialized size); visual box clamped, showing raw RAM values in amber."
+                )
+
+        # Highlight any row whose raw target RAM value differs from the clamped/current visual ROI
+        vdict = self.get_vertex_dict()
+        for row, name, v_type, target_val in read_rows:
+            disp_target = f"{target_val:.4g}" if v_type == "float" else str(int(target_val))
+            try:
+                re_eval = eval_roi_formula(row["formula"].get(), vdict)
+                _, _, disp_box = self._encode_typed_value(re_eval, v_type)
+            except Exception:
+                disp_box = None
+
+            if sol is None or disp_box != disp_target:
+                row["val_lbl"].configure(text=disp_target, text_color="#FFB74D")
 
     # --- LAYOUT PERSISTENCE ---
     def get_state(self):

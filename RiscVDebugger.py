@@ -1,6 +1,7 @@
 # RiscVLiveDebugger.py
 import json
 import os
+import re
 import threading
 import traceback
 import customtkinter as ctk
@@ -96,7 +97,15 @@ class ModernOpenOCD_GUI(ctk.CTk):
         self.lst_label.pack(side="left", padx=8)
 
         ctk.CTkButton(file_frame, text="Save Layout", width=90, fg_color="#555555", command=self.save_layout).pack(side="right")
-        ctk.CTkButton(file_frame, text="Load Layout", width=90, fg_color="#555555", command=self.load_layout).pack(side="right", padx=10)
+        ctk.CTkButton(file_frame, text="Load Layout", width=90, fg_color="#555555", command=self.load_layout).pack(side="right", padx=8)
+        ctk.CTkButton(
+            file_frame,
+            text="Sync from Target",
+            width=125,
+            fg_color="#00838F",
+            hover_color="#006064",
+            command=self.sync_write_widgets,
+        ).pack(side="right", padx=(8, 0))
 
         add_frame = ctk.CTkFrame(self, fg_color="transparent")
         add_frame.pack(fill="x", padx=20, pady=(2, 10))
@@ -281,6 +290,74 @@ class ModernOpenOCD_GUI(ctk.CTk):
             self.notify_symbol_files_updated()
         except Exception as e:
             self.log_msg(f"ERROR reading .lst file: {e}")
+
+    def sync_write_widgets(self, target_widgets=None):
+        """Reads live target RAM values once and updates write widgets (excluding MemFileLoader)."""
+        self.abort_transfers = False
+
+        if target_widgets is None:
+            widgets = [
+                w for w in self.scrollable_frame.winfo_children()
+                if w.winfo_exists() and hasattr(w, "get_sync_requests")
+            ]
+        else:
+            widgets = [w for w in target_widgets if w.winfo_exists() and hasattr(w, "get_sync_requests")]
+
+        if not widgets:
+            self.log_msg("Sync: No write-capable widgets on the workspace to sync.")
+            return
+
+        # Collect unique (addr, mem_cmd) pairs across all targeted write widgets
+        unique_reqs = []
+        seen = set()
+        active_widgets = []
+        for w in widgets:
+            reqs = w.get_sync_requests()
+            if reqs:
+                active_widgets.append(w)
+                for key in reqs:
+                    if key not in seen:
+                        seen.add(key)
+                        unique_reqs.append(key)
+
+        if not unique_reqs:
+            return
+
+        def _sync_task():
+            raw_results = {}
+            with self.jtag_lock:
+                if self.abort_transfers:
+                    return
+                try:
+                    with OpenOCDSession(timeout=2.5) as ocd:
+                        state = ocd.send("[target current] curstate")
+                        was_running = "running" in state
+                        if was_running:
+                            ocd.send("halt; wait_halt")
+                        try:
+                            for addr, mem_cmd in unique_reqs:
+                                resp = ocd.send(f"{mem_cmd} {addr}")
+                                m = re.search(r":\s*([0-9a-fA-F]+)", resp)
+                                if m:
+                                    raw_results[(addr, mem_cmd)] = int(m.group(1), 16)
+                        finally:
+                            if was_running and not self.target_halted_at_bp:
+                                ocd.send("resume")
+                except Exception as e:
+                    self.after(0, lambda: self.log_msg(f"Sync ERROR (Is OpenOCD connected?): {e}"))
+                    return
+
+            def _apply_all():
+                synced = 0
+                for w in active_widgets:
+                    if w.winfo_exists():
+                        w.apply_sync_results(raw_results)
+                        synced += 1
+                self.log_msg(f"Synced {synced} write widget(s) from target RAM.")
+
+            self.after(0, _apply_all)
+
+        threading.Thread(target=_sync_task, daemon=True).start()
 
     def save_layout(self):
         filepath = filedialog.asksaveasfilename(

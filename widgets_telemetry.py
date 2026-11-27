@@ -12,6 +12,18 @@ from matplotlib.figure import Figure
 
 from ocd_backend import OpenOCDSession
 
+def decode_ocd_word(raw_u32: int, v_type: str):
+    """Converts a raw unsigned hex integer from OpenOCD into a typed Python int or float."""
+    if v_type == "float":
+        packed = struct.pack("<I", raw_u32 & 0xFFFFFFFF)
+        return struct.unpack("<f", packed)[0]
+
+    bits = 8 if "8" in v_type else (16 if "16" in v_type else 32)
+    mask = (1 << bits) - 1
+    val = raw_u32 & mask
+    if v_type.startswith("int") and (val & (1 << (bits - 1))):
+        val -= 1 << bits
+    return val
 
 class BaseWidget(ctk.CTkFrame):
     GRID_SNAP = 20  # Snap position and size to 20px grid
@@ -120,8 +132,14 @@ class BaseWidget(ctk.CTkFrame):
         for target in (self._vp_canvas, self._inner_frame):
             target.bind("<MouseWheel>", self._on_tile_mousewheel)
 
-        # Right-click context menu fallback to delete a widget at any time
+        # Right-click context menu for per-widget sync and deletion
         self._ctx_menu = tk.Menu(self, tearoff=0)
+        if hasattr(self, "get_sync_requests"):
+            self._ctx_menu.add_command(
+                label="Sync from Target",
+                command=lambda: self.app.sync_write_widgets([self]),
+            )
+            self._ctx_menu.add_separator()
         self._ctx_menu.add_command(label="Delete Widget", command=self.destroy)
         for target in (self, self._vp_canvas, self._inner_frame):
             target.bind("<Button-3>", self._show_context_menu)
@@ -433,7 +451,7 @@ class VarSlider(BaseWidget):
             self.app.log_msg("ERROR: Min and Max must be valid integers.")
 
     def on_slider_change(self, val):
-        if not self.winfo_exists():
+        if getattr(self, "_syncing", False) or not self.winfo_exists():
             return
         int_val = int(val)
         self.current_val_label.configure(text=f"Target Value: {int_val}")
@@ -478,6 +496,66 @@ class VarSlider(BaseWidget):
                     self.after(0, lambda: self.app.log_msg(f"Write ERROR: {str(e)}"))
 
         threading.Thread(target=_write_task, daemon=True).start()
+
+    def get_sync_requests(self):
+        name = self.var_name.get().strip()
+        addr = self.get_resolved_addr(name)
+        if not addr:
+            self.app.log_msg(f"Sync Skip: '{name}' is not a valid map symbol or hex address.")
+            return []
+        v_type = self.var_type.get()
+        mem_cmd = "mdb" if "8" in v_type else ("mdh" if "16" in v_type else "mdw")
+        return [(addr, mem_cmd)]
+
+    def apply_sync_results(self, raw_map: dict):
+        name = self.var_name.get().strip()
+        addr = self.get_resolved_addr(name)
+        v_type = self.var_type.get()
+        mem_cmd = "mdb" if "8" in v_type else ("mdh" if "16" in v_type else "mdw")
+        raw_u32 = raw_map.get((addr, mem_cmd))
+        if raw_u32 is None or not self.winfo_exists():
+            return
+
+        val = int(decode_ocd_word(raw_u32, v_type))
+        if self.slider_timer:
+            self.after_cancel(self.slider_timer)
+            self.slider_timer = None
+
+        try:
+            min_v = int(self.min_val.get())
+        except ValueError:
+            min_v = 0
+        try:
+            max_v = int(self.max_val.get())
+        except ValueError:
+            max_v = 255
+
+        bounds_changed = False
+        if val < min_v:
+            min_v = val
+            self.min_val.set(str(min_v))
+            bounds_changed = True
+        if val > max_v:
+            max_v = val
+            self.max_val.set(str(max_v))
+            bounds_changed = True
+        if min_v >= max_v:
+            max_v = min_v + 1
+            self.max_val.set(str(max_v))
+            bounds_changed = True
+
+        self._syncing = True
+        try:
+            self.slider.configure(from_=min_v, to=max_v)
+            self.slider.set(val)
+            self.current_val_label.configure(text=f"Target Value: {val}")
+        finally:
+            self._syncing = False
+
+        if bounds_changed:
+            self.app.log_msg(
+                f"Sync Note: Expanded '{name}' slider range to [{min_v}, {max_v}] to fit target value {val}."
+            )
 
     def get_state(self):
         return {
@@ -588,7 +666,7 @@ class EnumSelectorWidget(BaseWidget):
         self.after(20, self._on_viewport_configure)
 
     def on_choice_selected(self, label):
-        if not self.winfo_exists():
+        if getattr(self, "_syncing", False) or not self.winfo_exists():
             return
         val = self.parsed_choices.get(label)
         if val is not None:
@@ -647,6 +725,50 @@ class EnumSelectorWidget(BaseWidget):
 
         threading.Thread(target=_write_task, daemon=True).start()
 
+    def get_sync_requests(self):
+        name = self.var_name.get().strip()
+        addr = self.get_resolved_addr(name)
+        if not addr:
+            self.app.log_msg(f"Sync Skip: '{name}' is not a valid map symbol or hex address.")
+            return []
+        v_type = self.var_type.get()
+        mem_cmd = "mdw" if v_type == "float" else ("mdb" if "8" in v_type else ("mdh" if "16" in v_type else "mdw"))
+        return [(addr, mem_cmd)]
+
+    def apply_sync_results(self, raw_map: dict):
+        name = self.var_name.get().strip()
+        addr = self.get_resolved_addr(name)
+        v_type = self.var_type.get()
+        mem_cmd = "mdw" if v_type == "float" else ("mdb" if "8" in v_type else ("mdh" if "16" in v_type else "mdw"))
+        raw_u32 = raw_map.get((addr, mem_cmd))
+        if raw_u32 is None or not self.winfo_exists():
+            return
+
+        val = decode_ocd_word(raw_u32, v_type)
+        matched_label = None
+        for lbl, c_val in self.parsed_choices.items():
+            if v_type == "float":
+                if abs(float(val) - float(c_val)) <= max(1e-6, 1e-5 * abs(float(c_val))):
+                    matched_label = lbl
+                    break
+            else:
+                if int(val) == int(c_val):
+                    matched_label = lbl
+                    break
+
+        self._syncing = True
+        try:
+            if matched_label is not None:
+                self.current_selection.set(matched_label)
+            else:
+                self.current_selection.set("")
+                disp = f"{val:.4g}" if v_type == "float" else str(val)
+                self.app.log_msg(
+                    f"Sync Warning: '{name}' = {disp} on target does not match any choice in [{self.choices_str.get()}]."
+                )
+        finally:
+            self._syncing = False
+            
     def get_state(self):
         return {
             "widget_type": "enum_selector",
