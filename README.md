@@ -234,8 +234,8 @@ Every widget on the dashboard is a movable, resizable 2D tile snapped to a `20 p
 ### Interactive 2D ROI / Cropping IP Controller (`widgets_roi.py`)
 
 #### 7. ROI Cropper (`+ ROI Cropper`)
-Built for interactive control of **FPGA Image Signal Processing (ISP) cropping cores, AXI4-Stream video windowing IPs, and 2D sensor regions of interest**:
-- **Configurable Virtual Sensor Frame (`Frame W` $\times$ `Frame H`):** Supports any virtual frame dimensions (e.g., `1920` $\times$ `1080`, `640` $\times$ `512`, or line-scan geometries like `4096` $\times$ `64`) using $0$-indexed inclusive coordinates from $(0, 0)$ at the upper-left corner to $(\text{FW}-1, \text{FH}-1)$ at the lower-right corner.
+Built for interactive control of **2D ROI**:
+- **Configurable Virtual Frame (`Frame W` $\times$ `Frame H`):** Supports any virtual frame dimensions (e.g., `1920` $\times$ `1080`, `640` $\times$ `512`, or line-scan geometries like `4096` $\times$ `64`) using $0$-indexed inclusive coordinates from $(0, 0)$ at the upper-left corner to $(\text{FW}-1, \text{FH}-1)$ at the lower-right corner.
 - **Multi-Mode Interactive 2D Canvas:**
   - **Resize Corners & Edges:** Drag any of the 8 grab handles (`UL`, `UR`, `LL`, `LR` corners or `N`, `S`, `E`, `W` mid-edges) to resize the crop window dynamically.
   - **Pan Window / Draw New Box:** Drag inside the cyan rectangle to pan the window while preserving its exact width and height against frame borders, drag outside to draw a new ROI from scratch, or click **Full Frame** to reset.
@@ -244,7 +244,7 @@ Built for interactive control of **FPGA Image Signal Processing (ISP) cropping c
   - **Available Tokens:** `UL_X`, `UL_Y` $(X_{\min}, Y_{\min})$, `UR_X`, `UR_Y` $(X_{\max}, Y_{\min})$, `LL_X`, `LL_Y` $(X_{\min}, Y_{\max})$, `LR_X`, `LR_Y` $(X_{\max}, Y_{\max})$, plus `FW` and `FH`.
 - **Coherent Single-Halt Batch Writes & $4 \times 4$ Inverse Sync:** Debounces mouse dragging (`100 ms`), flushes final coordinates on release, and writes all enabled ROI variables inside a **single `halt` $\to$ batch write $\to$ `resume` transaction** so streaming FPGA logic never encounters transient invalid window combinations (e.g., $\text{Anchor X} + \text{Width} > \text{FW}$). Clicking **Sync from Target** runs a $4 \times 4$ linear solver on your configured formulas to reconstruct the visual crop box from live RAM registers (highlighting uninitialized/clamped registers in amber).
 
-| Typical FPGA Cropping Register | Example Formula | Description |
+| Example Formula | Description |
 | :--- | :--- | :--- |
 | **Anchor X / Start Column** | `UL_X` | Horizontal start pixel offset |
 | **Anchor Y / Start Line** | `UL_Y` | Vertical start line offset |
