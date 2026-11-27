@@ -244,7 +244,7 @@ Built for interactive control of **2D ROI**:
   - **Available Tokens:** `UL_X`, `UL_Y` $(X_{\min}, Y_{\min})$, `UR_X`, `UR_Y` $(X_{\max}, Y_{\min})$, `LL_X`, `LL_Y` $(X_{\min}, Y_{\max})$, `LR_X`, `LR_Y` $(X_{\max}, Y_{\max})$, plus `FW` and `FH`.
 - **Coherent Single-Halt Batch Writes & $4 \times 4$ Inverse Sync:** Debounces mouse dragging (`100 ms`), flushes final coordinates on release, and writes all enabled ROI variables inside a **single `halt` $\to$ batch write $\to$ `resume` transaction** so streaming FPGA logic never encounters transient invalid window combinations (e.g., $\text{Anchor X} + \text{Width} > \text{FW}$). Clicking **Sync from Target** runs a $4 \times 4$ linear solver on your configured formulas to reconstruct the visual crop box from live RAM registers (highlighting uninitialized/clamped registers in amber).
 
-| Example Formula | Description |
+| Parameter | Example Formula | Description |
 | :--- | :--- | :--- |
 | **Anchor X / Start Column** | `UL_X` | Horizontal start pixel offset |
 | **Anchor Y / Start Line** | `UL_Y` | Vertical start line offset |
