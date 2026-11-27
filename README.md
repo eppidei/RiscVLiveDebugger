@@ -1,6 +1,6 @@
 # Live Memory Tuner, Telemetry & Hardware Breakpoint Dashboard
 
-A standalone, non-intrusive memory inspection, live parameter tuning, hardware breakpoint/watchpoint, and telemetry acquisition GUI for embedded processors and FPGA soft-cores.
+A standalone, non-intrusive memory inspection, live parameter tuning, interactive 2D ROI/cropping control, hardware breakpoint/watchpoint, and telemetry acquisition GUI for embedded processors and FPGA soft-cores.
 
 While conceived specifically to overcome the limitations of debugging workflows on **Microchip PolarFire SoC and Mi-V (RISC-V)** soft-cores, the architecture connects directly to **OpenOCD's TCL server (port 6666)** and is target-agnostic—functioning with any CPU or core supported by OpenOCD (RISC-V, ARM Cortex-M, ESP32, etc.).
 
@@ -26,7 +26,7 @@ Developing real-time embedded firmware on FPGA soft-cores (such as the Microchip
 
 - **Invasive Halts Destroy Real-Time Systems:** Traditional debugging relies on heavy GDB sessions. Prolonged halts freeze PWM generation, motor commutation, closed-loop PID controllers, and active communication buses, frequently triggering hardware faults.
 - **GDB Polling Instability:** Continuous watch-expression polling over GDB often leads to serial/JTAG packet desynchronization, crashing the GDB server and necessitating complete hardware power cycles.
-- **Lack of Specialized Instrumentation:** Standard debuggers cannot natively render live time-series plots, decode fixed-point ($Q$-format) fractions, parse hardware bitfield registers dynamically, or plot memory arrays as histograms.
+- **Lack of Specialized Instrumentation:** Standard debuggers cannot natively render live time-series plots, interactively drag 2D sensor/video cropping windows, decode fixed-point ($Q$-format) fractions, parse hardware bitfield registers dynamically, or plot memory arrays as histograms.
 - **Heavyweight Footprint:** Requiring a multi-gigabyte IDE installation just to tune control parameters, inspect buffers, or test hardware in a lab environment introduces unnecessary overhead.
 
 ### The Solution
@@ -41,13 +41,14 @@ This tool bypasses GDB entirely and is built as a **live-attach instrumentation 
 
 ## 2. Modular Architecture & Repository Structure
 
-The application is split into four focused Python modules for maintainability:
+The application is split into five focused Python modules for maintainability:
 
 ```text
 RiscVLiveDebugger/
-├── RiscVLiveDebugger.py     # Main GUI window, top toolbars, layout persistence, and workspace
+├── RiscVLiveDebugger.py     # Main GUI window, top toolbars, target sync, layout persistence, and workspace
 ├── ocd_backend.py           # OpenOCD TCP socket client, colorized console launcher, .map & .lst parsers
-├── widgets_telemetry.py     # BaseWidget (drag/resize), VarSlider, EnumSelector, ReadMonitor, Plotter, Loader, AliveLight
+├── widgets_telemetry.py     # BaseWidget (drag/resize/scroll), VarSlider, EnumSelector, ReadMonitor, Plotter, Loader, AliveLight
+├── widgets_roi.py           # RoiCropWidget (Interactive 2D ROI / FPGA Cropping IP controller & formula solver)
 ├── widgets_breakpoints.py   # BaseBreakpointWidget, BreakOnFunc, BreakOnLine, BreakOnVar
 ├── requirements.txt         # customtkinter, matplotlib
 ├── README.md
@@ -60,13 +61,14 @@ RiscVLiveDebugger/
 ```text
 +-----------------------------------------------------------------------+
 |          Live Memory Tuner & Breakpoint GUI (CustomTkinter)           |
-|  [ReadVar] [WriteSlider] [EnumSwitch] [MemPlotter] [BreakOnFunc/Line] |
+| [ReadVar] [WriteSlider] [EnumSwitch] [ROICropper] [Plotter] [BreakOn] |
 +-----------------------------------+-----------------------------------+
                                     |
                   Local TCP Socket (Port 6666 / TCL IPC)
-                  * Thread-safe Mutex Lock (self.jtag_lock)
-                  * Atomic Halt -> Read/Write -> Resume (Telemetry)
-                  * Hardware Trigger -> Full RAM Snapshot (Breakpoints)
+                  - Thread-safe Mutex Lock (self.jtag_lock)
+                  - Atomic Halt -> Read/Write -> Resume (Telemetry & ROI)
+                  - On-Demand Batch Read -> UI State Sync (Write Widgets)
+                  - Hardware Trigger -> Full RAM Snapshot (Breakpoints)
                                     |
 +-----------------------------------v-----------------------------------+
 |                        OpenOCD Server Process                         |
@@ -93,7 +95,7 @@ To enable live parameter modification, telemetry acquisition, and function/varia
 
 ### 1. Always Declare Monitored & Tuned Variables as `volatile` (Compiler Barrier)
 If a variable is not marked `volatile`, GCC's optimization passes (`-O1`, `-O2`, `-O3`, `-Os`) will cache the value inside CPU general-purpose registers (`s0`–`s11`, `a0`–`a7`) across loop iterations and omit physical memory loads or stores.
-- **Control variables without `volatile`:** The CPU loads the variable once before entering `while (1)` and never reads RAM again—ignoring GUI slider or choice switcher updates.
+- **Control variables without `volatile`:** The CPU loads the variable once before entering `while (1)` and never reads RAM again—ignoring GUI slider, choice switcher, or ROI cropper updates.
 - **Monitor variables without `volatile`:** The compiler keeps intermediate counters in registers or eliminates dead stores, leaving stale values in RAM.
 
 ```c
@@ -112,7 +114,7 @@ The GUI resolves variable addresses automatically by parsing the GNU Linker `.ma
 ### 3. When Uncached Memory (LSRAM) Is Strictly Necessary (Hardware Cache Barrier)
 On Microchip Mi-V cores, OpenOCD accesses memory when halted by injecting RISC-V load/store instructions (`lw`/`sw`) into the **Debug Program Buffer** and executing them **through the halted CPU's own Load/Store Unit (LSU)**. Because OpenOCD's memory accesses travel through the **exact same L1 Data Cache (D-Cache)** as your firmware:
 
-- **CPU-Only Control Variables (Cached RAM Works):** Global `volatile` variables written by the GUI (`VarSlider`, `EnumSelectorWidget`) and read exclusively by the CPU remain naturally coherent even in cached RAM. OpenOCD writes through the halted CPU's LSU directly into the D-Cache; when the CPU resumes, `volatile` forces a load instruction that hits the updated D-Cache line.
+- **CPU-Only Control Variables (Cached RAM Works):** Global `volatile` variables written by the GUI (`VarSlider`, `EnumSelectorWidget`, `RoiCropWidget`) and read exclusively by the CPU remain naturally coherent even in cached RAM. OpenOCD writes through the halted CPU's LSU directly into the D-Cache; when the CPU resumes, `volatile` forces a load instruction that hits the updated D-Cache line.
 - **FPGA Fabric / DMA Monitor Variables (Uncached LSRAM Mandatory):** If a monitored variable or buffer (e.g., ISP histograms, ADC DMA buffers, frame counters, hardware status words) is updated by **FPGA fabric logic (AXI4 master / DMA)** rather than the CPU, the CPU's D-Cache will hold stale lines. Placing those buffers in **uncached LSRAM** (typically mapped at `0x60000000` on PolarFire Mi-V designs) forces the CPU's LSU to bypass the D-Cache and read physical memory directly.
 - **Deterministic Cache Footprint for Large Dumps:** Placing large arrays read by the **Memory Block Plotter** into uncached LSRAM prevents JTAG block dumps from evicting time-critical firmware data out of the D-Cache (cache thrashing).
 
@@ -190,11 +192,14 @@ To keep production binaries completely free of debug overhead:
 
 ## 4. 2D Workspace & Widget Reference
 
-### Free-Form Drag, Drop & Resize Workspace
+### Free-Form Drag, Drop, Resize & Target Synchronization
 Every widget on the dashboard is a movable, resizable 2D tile snapped to a `20 px` alignment grid:
 - **Move Tile (`⠿` Top-Left Handle):** Click and drag the `⠿` icon (or the widget border) to position widgets side-by-side or stack compact indicators next to large plots.
-- **Resize Tile (`◢` Bottom-Right Grip):** Drag the bottom-right corner to resize any widget horizontally or vertically. Internal plots, sliders, and scrollable lists scale automatically.
-- **Save / Load Layout (`layout.json`):** Saves all active widgets, their configured symbols/parameters, and their exact `(x, y, width, height)` geometry coordinates.
+- **Resize Tile (`◢` Bottom-Right Grip) & Auto-Scrollbars:** Drag the bottom-right corner to resize any widget horizontally or vertically. If a tile is shrunk smaller than its natural content bounds, horizontal and vertical scrollbars appear automatically inside the tile (with mouse-wheel scrolling and a right-click **Delete Widget** fallback).
+- **Save / Load Layout (`layout.json`):** Saves all active widgets, their configured symbols/parameters, and their exact `(x, y, w, h)` geometry coordinates.
+- **Sync Write Widgets from Target (`Sync from Target`):** Reads live firmware RAM values on demand and updates all write-capable widgets (`VarSlider`, `EnumSelectorWidget`, and `RoiCropWidget`, intentionally excluding `MemFileLoader`):
+  - **Why Manual:** Loading a `.json` layout frequently leaves sliders or controls at `0` (or saved preset values) while firmware is already running with different parameters. Keeping sync user-triggered avoids unsolicited CPU halts on layout load and preserves the ability to load a layout as a preset to push *to* the target.
+  - **Coherent & Silent Update:** Deduplicates all target addresses into a single `halt` $\to$ batch read $\to$ `resume` transaction and updates widget UI states silently without echoing writes back over JTAG. Automatically expands `VarSlider` `[Min, Max]` bounds if the live software value lies outside the current range, deselects unmatched `EnumSelectorWidget` buttons with a log warning, and solves `RoiCropWidget` linear equations in reverse to snap the 2D rectangle to live software coordinates. Also accessible individually per widget via the right-click menu (**Sync from Target**).
 
 ---
 
@@ -226,6 +231,30 @@ Every widget on the dashboard is a movable, resizable 2D tile snapped to a `20 p
 
 ---
 
+### Interactive 2D ROI / Cropping IP Controller (`widgets_roi.py`)
+
+#### 7. ROI Cropper (`+ ROI Cropper`)
+Built for interactive control of **FPGA Image Signal Processing (ISP) cropping cores, AXI4-Stream video windowing IPs, and 2D sensor regions of interest**:
+- **Configurable Virtual Sensor Frame (`Frame W` $\times$ `Frame H`):** Supports any virtual frame dimensions (e.g., `1920` $\times$ `1080`, `640` $\times$ `512`, or line-scan geometries like `4096` $\times$ `64`) using $0$-indexed inclusive coordinates from $(0, 0)$ at the upper-left corner to $(\text{FW}-1, \text{FH}-1)$ at the lower-right corner.
+- **Multi-Mode Interactive 2D Canvas:**
+  - **Resize Corners & Edges:** Drag any of the 8 grab handles (`UL`, `UR`, `LL`, `LR` corners or `N`, `S`, `E`, `W` mid-edges) to resize the crop window dynamically.
+  - **Pan Window / Draw New Box:** Drag inside the cyan rectangle to pan the window while preserving its exact width and height against frame borders, drag outside to draw a new ROI from scratch, or click **Full Frame** to reset.
+  - **1-Pixel Precision Inputs:** Editable `UL_X`, `UL_Y`, `LR_X`, `LR_Y` entries below the canvas allow exact single-pixel coordinate entry on scaled high-resolution frames.
+- **Vertex Coordinate Tokens & Linear Combination Formulas:** Maps up to **4 firmware variables** (from `.map` or raw hex addresses) to arithmetic/linear combinations (`+`, `-`, `*`, `/`, `//`, `%`, parentheses, and constants) of the 4 vertices and frame dimensions, encoded as `uint8`–`int32` or `float`:
+  - **Available Tokens:** `UL_X`, `UL_Y` $(X_{\min}, Y_{\min})$, `UR_X`, `UR_Y` $(X_{\max}, Y_{\min})$, `LL_X`, `LL_Y` $(X_{\min}, Y_{\max})$, `LR_X`, `LR_Y` $(X_{\max}, Y_{\max})$, plus `FW` and `FH`.
+- **Coherent Single-Halt Batch Writes & $4 \times 4$ Inverse Sync:** Debounces mouse dragging (`100 ms`), flushes final coordinates on release, and writes all enabled ROI variables inside a **single `halt` $\to$ batch write $\to$ `resume` transaction** so streaming FPGA logic never encounters transient invalid window combinations (e.g., $\text{Anchor X} + \text{Width} > \text{FW}$). Clicking **Sync from Target** runs a $4 \times 4$ linear solver on your configured formulas to reconstruct the visual crop box from live RAM registers (highlighting uninitialized/clamped registers in amber).
+
+| Typical FPGA Cropping Register | Example Formula | Description |
+| :--- | :--- | :--- |
+| **Anchor X / Start Column** | `UL_X` | Horizontal start pixel offset |
+| **Anchor Y / Start Line** | `UL_Y` | Vertical start line offset |
+| **Window Length X (Width)** | `UR_X - UL_X + 1` | Inclusive horizontal pixel width |
+| **Window Length Y (Height)** | `LL_Y - UL_Y + 1` | Inclusive vertical line height |
+| **AXI4-Stream Beats (4 px/clk)** | `(UR_X - UL_X + 1) // 4` | Horizontal width in multi-pixel clock beats |
+| **Right / Bottom Blank Margin** | `FW - 1 - UR_X` | Remaining pixels after crop end |
+
+---
+
 ### Hardware Breakpoint & Watchpoint Widgets (`widgets_breakpoints.py`)
 
 All three breakpoint widgets use the RISC-V Debug Trigger Module (`hw` triggers) and share a unified **Split-Pane Freeze-Frame Architecture**:
@@ -251,8 +280,9 @@ When clicking **Start OpenOCD**, `ocd_backend.py` launches OpenOCD with `-s <con
 - **`Info :`** lines highlight in **Cyan**
 - Routine debug state lines print in **Gray**
 
-### Target Reset (`reset run`)
-Clicking **Reset CPU** dispatches `rbp all; rwp all; reset run` over port 6666, clearing active hardware triggers and rebooting the processor cleanly.
+### Target Reset (`reset run`) & Instant Queue Flush
+- Clicking **Reset CPU** dispatches `rbp all; rwp all; reset run` over port 6666, clearing active hardware triggers and rebooting the processor cleanly.
+- Clicking **Stop OpenOCD** immediately disables all active `Auto Poll` switches, disarms breakpoint timers, and sets an abort latch (`self.abort_transfers`) so in-flight threads exit immediately without socket timeout pile-ups.
 
 ---
 
@@ -274,7 +304,8 @@ python RiscVLiveDebugger.py
 1. Browse to `openocd.exe` and your target `.cfg` file, then click **Start OpenOCD**.
 2. Click **Upload .map File** and select your compiled firmware's `.map` file.
 3. *(Optional)* Click **Upload .lst File (Opt)** and select your project's `.lst` disassembly file if you plan to use **Break on Line**.
-4. Add telemetry, control, or breakpoint widgets from the toolbar, arrange and resize them on the 2D canvas, and click **Save Layout** to persist your workspace.
+4. Add telemetry, control, ROI cropper, or breakpoint widgets from the toolbar, arrange and resize them on the 2D canvas, and click **Save Layout** to persist your workspace.
+5. *(Optional)* When reloading a saved layout onto an already-running target, click **Sync from Target** to populate all write-capable widgets (`VarSlider`, `EnumSelectorWidget`, `RoiCropWidget`) with live software values from RAM.
 
 ---
 
@@ -294,7 +325,7 @@ In the **RISC-V External Debug Support Specification**, a Debug Module can acces
 | Characteristic | CPU-Mediated Access (Current) | System Bus Access (SBA) |
 | :--- | :--- | :--- |
 | **Hardware Mechanism** | Injects `lw`/`sw` instructions executed by the halted RISC-V core's LSU. | Dedicated bus master inside the Debug Module connected directly to AXI4 / AHB / TileLink. |
-| **Core Halt Required?** | **Yes** (`halt; wait_halt` ➔ `op` ➔ `resume`). | **No.** Reads and writes occur while the CPU runs at full speed. |
+| **Core Halt Required?** | **Yes** (`halt; wait_halt` $\to$ `op` $\to$ `resume`). | **No.** Reads and writes occur while the CPU runs at full speed. |
 | **D-Cache Coherency** | **Coherent** with the CPU's L1 D-Cache (traverses the core's LSU). | **Non-coherent** (bypasses L1 D-Cache; sees physical RAM/bus only). |
 | **Uncached Memory Rule** | Mandatory only for FPGA fabric / DMA-shared data. | **Strictly mandatory for all variables** (cached CPU writes are invisible to SBA). |
 | **PolarFire Mi-V Support** | **Supported** (`MIV_RV32` / `MIV_ESS`). | **Not implemented** (omitted to conserve FPGA LUT/fabric resources). |
